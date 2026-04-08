@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  backend-ttc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backend-ttc
+    restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:3000'
+    environment:
+      # Puerto de la aplicación
+      - PORT=${PORT:-3000}
+
+      # URLs de APIs externas
+      - NIMBUS_API_URL=${NIMBUS_API_URL}
+      - WIALON_API_URL=${WIALON_API_URL}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+
+      # Firebase Configuration
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID:-apptransportettc}
+      - FIREBASE_DATABASE_NAME=${FIREBASE_DATABASE_NAME:-transporte-db}
+
+      # Firebase Authentication (HÍBRIDO - 3 métodos soportados)
+      # Método 1: Variable de entorno (Easypanel/Docker sin gcloud)
+      - FIREBASE_SERVICE_ACCOUNT_JSON=${FIREBASE_SERVICE_ACCOUNT_JSON:-}
+      # Método 2: Archivo firebase-key.json (comentar volumen si no se usa)
+      # Método 3: Google Cloud ADC (descomentar volumen si se usa gcloud)
+
+      # Node environment
+      - NODE_ENV=production
+
+    volumes:
+      # OPCIONAL: Montar credenciales de Google Cloud ADC desde el host
+      # Solo necesario si usas gcloud auth application-default login
+      # Comenta esta línea si usas FIREBASE_SERVICE_ACCOUNT_JSON
+      - ~/.config/gcloud:/home/nestjs/.config/gcloud:ro
+
+    networks:
+      - backend-network
+
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+    # Límites de recursos (ajustar según necesidades)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  backend-network:
+    driver: bridge

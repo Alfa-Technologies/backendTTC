@@ -1,0 +1,61 @@
+# Dependencias
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Build
+dist
+build
+*.tsbuildinfo
+
+# Tests
+coverage
+.nyc_output
+*.spec.ts
+test
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+
+# Documentación
+README.md
+CHANGELOG.md
+LICENSE
+*.md
+
+# Logs
+logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment (no copiar .env al build, se inyecta en runtime)
+.env
+.env.local
+.env.*.local
+
+# Temporal
+tmp
+temp
+*.tmp

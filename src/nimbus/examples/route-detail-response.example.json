@@ -1,0 +1,44 @@
+{
+  "success": true,
+  "route": {
+    "id": 12345,
+    "name": "Ruta Centro - Norte",
+    "from": "Terminal Centro",
+    "to": "Estación Norte",
+    "depotId": 100,
+    "stops": [
+      {
+        "id": 1,
+        "name": "Terminal Centro",
+        "lat": 19.4326,
+        "lng": -99.1332,
+        "order": 1
+      },
+      {
+        "id": 2,
+        "name": "Plaza Principal",
+        "lat": 19.4350,
+        "lng": -99.1300,
+        "order": 2
+      },
+      {
+        "id": 3,
+        "name": "Mercado Municipal",
+        "lat": 19.4380,
+        "lng": -99.1280,
+        "order": 3
+      },
+      {
+        "id": 4,
+        "name": "Estación Norte",
+        "lat": 19.4420,
+        "lng": -99.1250,
+        "order": 4
+      }
+    ],
+    "totalStops": 4,
+    "encodedPath": "u{~vFvyysM_@?_@?_@?_@?",
+    "distance": 5420,
+    "duration": 1200
+  }
+}

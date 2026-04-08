@@ -1,0 +1,68 @@
+{
+  "success": true,
+  "routes": [
+    {
+      "id": 12345,
+      "name": "Ruta Centro - Norte",
+      "from": "Terminal Centro",
+      "to": "Estación Norte",
+      "depotId": 100,
+      "stops": [
+        {
+          "id": 1,
+          "name": "Terminal Centro",
+          "latitude": 19.4326,
+          "longitude": -99.1332
+        },
+        {
+          "id": 2,
+          "name": "Plaza Principal",
+          "latitude": 19.4350,
+          "longitude": -99.1300
+        },
+        {
+          "id": 3,
+          "name": "Mercado Municipal",
+          "latitude": 19.4380,
+          "longitude": -99.1280
+        },
+        {
+          "id": 4,
+          "name": "Estación Norte",
+          "latitude": 19.4420,
+          "longitude": -99.1250
+        }
+      ],
+      "totalStops": 4
+    },
+    {
+      "id": 12346,
+      "name": "Ruta Sur - Poniente",
+      "from": "Terminal Sur",
+      "to": "Colonia Poniente",
+      "depotId": 100,
+      "stops": [
+        {
+          "id": 5,
+          "name": "Terminal Sur",
+          "latitude": 19.4200,
+          "longitude": -99.1400
+        },
+        {
+          "id": 6,
+          "name": "Parque Central",
+          "latitude": 19.4180,
+          "longitude": -99.1420
+        },
+        {
+          "id": 7,
+          "name": "Colonia Poniente",
+          "latitude": 19.4150,
+          "longitude": -99.1450
+        }
+      ],
+      "totalStops": 3
+    }
+  ],
+  "totalRoutes": 2
+}
