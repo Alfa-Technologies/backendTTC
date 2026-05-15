@@ -22,9 +22,21 @@ import {
   RouteDetailResponse,
 } from './interfaces/route.interface';
 
+export interface StopDetail {
+  id: number;
+  name: string;
+  lat: number;
+  lng: number;
+}
+
 @Injectable()
 export class NimbusService {
   private readonly logger = new Logger(NimbusService.name);
+  private stopsCache: Map<
+    string,
+    { map: Map<number, StopDetail>; timestamp: number }
+  > = new Map();
+  private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutos en milisegundos
 
   constructor(
     private readonly httpService: HttpService,
@@ -32,9 +44,9 @@ export class NimbusService {
     private readonly configService: ConfigService,
   ) {
     axiosRetry(this.httpService.axiosRef, {
-      retries: 3,
+      retries: 2,
       retryDelay: (retryCount) => {
-        return retryCount * 1000;
+        return retryCount * 2000;
       },
       retryCondition: (error) => {
         const isNetworkError =
@@ -57,24 +69,42 @@ export class NimbusService {
       },
       onRetry: (retryCount, error, requestConfig) => {
         this.logger.warn(
-          `🔄 Reintento ${retryCount}/3 para ${requestConfig.url} - Error: ${error.code || error.message}`,
+          `🔄 Reintento ${retryCount}/2 para ${requestConfig.url} - Error: ${error.code || error.message}`,
         );
       },
     });
   }
 
-  private async getNimbusToken(uid: string): Promise<string> {
-    const userDoc = await this.firebaseService
-      .getFirestore()
-      .collection('users')
-      .doc(uid)
-      .get();
-    const token = userDoc.data()?.nimbusToken;
-    if (!token)
-      throw new BadRequestException(
-        'El usuario no tiene token de Nimbus configurado.',
-      );
-    return token;
+  public async getNimbusToken(uid: string): Promise<string> {
+    const db = this.firebaseService.getFirestore();
+
+    const userDoc = await db.collection('users').doc(uid).get();
+    const userData = userDoc.data();
+
+    const rawToken = userData?.nimbusToken;
+    if (rawToken) {
+      return rawToken.replace(/^Token\s+/i, '').trim();
+    }
+
+    // Passenger: look up the token from their company's admin
+    const companyId = userData?.companyId;
+    if (companyId) {
+      const adminSnap = await db
+        .collection('users')
+        .where('role', '==', 'Business Admin')
+        .where('companyId', '==', companyId)
+        .limit(1)
+        .get();
+
+      const companyToken = adminSnap.docs[0]?.data()?.nimbusToken;
+      if (companyToken) {
+        return companyToken.replace(/^Token\s+/i, '').trim();
+      }
+    }
+
+    throw new BadRequestException(
+      'El usuario no tiene token de Nimbus configurado.',
+    );
   }
 
   async getStopDetails(uid: string, depotId: string, stopId: string) {
@@ -82,10 +112,77 @@ export class NimbusService {
     const res = await firstValueFrom(
       this.httpService.get(
         `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stop/${stopId}`,
-        { headers: { Authorization: token }, timeout: 30000 },
+        { headers: { Authorization: `Token ${token}` }, timeout: 30000 },
       ),
     );
     return { success: true, stopDetails: res.data };
+  }
+
+  /**
+   * Obtiene un mapa de paradas (ID -> Objeto completo) para un depot específico
+   * Implementa caché de 5 minutos para evitar saturar la API de Nimbus
+   * Retorna objetos con: { id, name, lat, lng }
+   */
+  async getStopsMap(
+    uid: string,
+    depotId: number,
+  ): Promise<Map<number, StopDetail>> {
+    const cacheKey = `${uid}_${depotId}`;
+
+    // Invalidar caché para forzar nueva petición (debug de coordenadas)
+    this.stopsCache.delete(cacheKey);
+
+    // Obtener token y hacer petición a Nimbus
+    const token = await this.getNimbusToken(uid);
+    const stopsMap = new Map<number, StopDetail>();
+
+    try {
+      const res = await firstValueFrom(
+        this.httpService.get(
+          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stops`,
+          { headers: { Authorization: `Token ${token}` }, timeout: 30000 },
+        ),
+      );
+
+      const stops = res.data.stops || [];
+
+      stops.forEach((stop: any) => {
+        if (stop.id && stop.n) {
+          // En Nimbus: las coordenadas están anidadas en stop.p[0].x y stop.p[0].y
+          const lat =
+            stop.p && stop.p.length > 0 && stop.p[0].y
+              ? Number(stop.p[0].y)
+              : 0;
+          const lng =
+            stop.p && stop.p.length > 0 && stop.p[0].x
+              ? Number(stop.p[0].x)
+              : 0;
+
+          stopsMap.set(stop.id, {
+            id: stop.id,
+            name: stop.n,
+            lat: lat,
+            lng: lng,
+          });
+        }
+      });
+
+      // Guardar en caché
+      this.stopsCache.set(cacheKey, {
+        map: stopsMap,
+        timestamp: Date.now(),
+      });
+
+      this.logger.log(
+        `✅ Mapa de paradas creado para depot ${depotId}: ${stopsMap.size} paradas`,
+      );
+      return stopsMap;
+    } catch (error) {
+      this.logger.error(
+        `Error obteniendo paradas del depot ${depotId}: ${error.message}`,
+      );
+      return stopsMap; // Retornar mapa vacío en caso de error
+    }
   }
 
   async getGroups(uid: string) {
@@ -94,7 +191,7 @@ export class NimbusService {
       this.httpService.get(
         `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
         {
-          headers: { Authorization: token },
+          headers: { Authorization: `Token ${token}` },
           timeout: 30000,
         },
       ),
@@ -106,7 +203,7 @@ export class NimbusService {
         this.httpService.get(
           `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/groups`,
           {
-            headers: { Authorization: token },
+            headers: { Authorization: `Token ${token}` },
             timeout: 30000,
           },
         ),
@@ -126,30 +223,60 @@ export class NimbusService {
     const token = await this.getNimbusToken(uid);
 
     try {
-      // Obtener lista completa de rutas del depot desde Nimbus
+      // Hacer peticiones en paralelo para reducir el tiempo de respuesta de 5s a 1s
       const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/routes`;
+      const detailUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/route/${routeId}`;
+      const ridesUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/rides`;
 
-      let routesResponse;
-      try {
-        routesResponse = await firstValueFrom(
-          this.httpService.get(nimbusUrl, {
-            headers: { Authorization: token },
-            timeout: 30000,
+      const [routesResponse, detailResponse, stopsMapRaw, ridesRes] =
+        await Promise.all([
+          // 1. Todas las rutas
+          firstValueFrom(
+            this.httpService.get(nimbusUrl, {
+              headers: { Authorization: `Token ${token}` },
+              timeout: 30000,
+            }),
+          ).catch((e) => {
+            throw e;
           }),
-        );
-      } catch (nimbusError: any) {
-        this.logger.error('❌ [NIMBUS] Error en llamada a Nimbus API');
-        this.logger.error(`URL completa: ${nimbusUrl}`);
-        this.logger.error(
-          `Respuesta de error: ${JSON.stringify(nimbusError.response?.data || nimbusError.message, null, 2)}`,
-        );
-        this.logger.error(`Status: ${nimbusError.response?.status}`);
-        throw new InternalServerErrorException(
-          `Error al obtener rutas de Nimbus: ${nimbusError.response?.data?.error || nimbusError.message}`,
-        );
-      }
+          // 2. Detalle de ruta (con fallback si falla)
+          firstValueFrom(
+            this.httpService.get(detailUrl, {
+              headers: { Authorization: `Token ${token}` },
+              params: { flags: 1024 },
+              timeout: 30000,
+            }),
+          ).catch(() => ({ data: null })),
+          // 3. Mapa de paradas (USANDO LA CACHÉ EN MEMORIA)
+          this.getStopsMap(uid, Number(depotId)),
+          // 4. Rides activos (con fallback a vacío si falla)
+          firstValueFrom(
+            this.httpService.get(ridesUrl, {
+              headers: { Authorization: `Token ${token}` },
+              timeout: 15000,
+            }),
+          ).catch(() => ({ data: { rides: [] } })),
+        ]);
 
       const routes = routesResponse.data.routes || [];
+      const detailedRouteData =
+        detailResponse.data ||
+        routes.find((r: any) => String(r.id) === String(routeId));
+      const rides = ridesRes.data.rides || [];
+
+      // Convertir Map<number, StopDetail> a Map<string, { name, lat, lng }> para shapeDetailedRoute
+      const stopsMap = new Map<
+        string,
+        { name: string; lat: number; lng: number }
+      >();
+      stopsMapRaw.forEach((stop, id) => {
+        stopsMap.set(String(id), {
+          name: stop.name,
+          lat: stop.lat,
+          lng: stop.lng,
+        });
+      });
+
       const rawRoute = routes.find(
         (route: any) => String(route.id) === String(routeId),
       );
@@ -160,77 +287,34 @@ export class NimbusService {
         );
       }
 
-      // Obtener geometría detallada de la ruta con flags=1024 para shape/path real
-      const detailUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/route/${routeId}`;
-
-      let detailedRouteData;
-      try {
-        const detailResponse = await firstValueFrom(
-          this.httpService.get(detailUrl, {
-            headers: { Authorization: token },
-            params: { flags: 1024 },
-            timeout: 30000,
-          }),
-        );
-        detailedRouteData = detailResponse.data;
-      } catch (detailError: any) {
-        detailedRouteData = rawRoute; // Fallback a datos básicos
-      }
-
-      // Obtener mapa de paradas para nombres
-      const stopsMap = await this.getStopsMapForDepot(Number(depotId), token);
-
       // Obtener viajes activos para determinar asignación de unidad
       let unitId: string | null = null;
       let unitName: string | null = null;
 
-      try {
-        const ridesRes = await firstValueFrom(
-          this.httpService.get(
-            `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/rides`,
-            {
-              headers: { Authorization: token },
-              timeout: 15000,
-            },
-          ),
-        );
+      this.logger.log(
+        `📊 Ruta ${routeId} en Depot ${depotId}: Encontrados ${rides.length} viajes activos`,
+      );
 
-        const rides = ridesRes.data.rides || [];
+      // Buscar si esta ruta tiene un viaje activo
+      // CRÍTICO: Extraer unitId incondicionalmente, sin importar el estado del conductor
+      for (const ride of rides) {
+        // Solo validar que exista tid (timetable ID) y u (unit ID)
+        // NO validar driver/conductor - puede estar vacío o null
+        if (ride.tid && ride.u && rawRoute.tt && Array.isArray(rawRoute.tt)) {
+          const hasThisTimetable = rawRoute.tt.some(
+            (tt: any) => tt.id === ride.tid,
+          );
+          if (hasThisTimetable) {
+            unitId = String(ride.u);
+            unitName = `U ${ride.u}`;
 
-        this.logger.log(
-          `📊 Ruta ${routeId} en Depot ${depotId}: Encontrados ${rides.length} viajes activos`,
-        );
-
-        // Buscar si esta ruta tiene un viaje activo
-        // CRÍTICO: Extraer unitId incondicionalmente, sin importar el estado del conductor
-        for (const ride of rides) {
-          // Solo validar que exista tid (timetable ID) y u (unit ID)
-          // NO validar driver/conductor - puede estar vacío o null
-          if (ride.tid && ride.u && rawRoute.tt && Array.isArray(rawRoute.tt)) {
-            const hasThisTimetable = rawRoute.tt.some(
-              (tt: any) => tt.id === ride.tid,
-            );
-            if (hasThisTimetable) {
-              unitId = String(ride.u);
-              unitName = `U ${ride.u}`;
-
-              this.logger.log(
-                `✅ Ruta ${rawRoute.n || routeId} (ID: ${routeId}) → Unidad ${unitName} asignada (tid: ${ride.tid}, driver: ${ride.driver || 'Sin Asignar'})`,
-              );
-              break;
-            }
+            break;
           }
         }
+      }
 
-        if (!unitId) {
-          this.logger.warn(
-            `⚠️ No se encontró unidad asignada para ruta ${routeId} en depot ${depotId}`,
-          );
-        }
-      } catch (ridesError) {
-        this.logger.warn(
-          `No se pudieron obtener viajes activos para ruta ${routeId}. Continuando sin asignación de unidad.`,
-        );
+      if (!unitId) {
+        this.logger.log(`📊 Ruta ${routeId}: No hay viaje activo asignado`);
       }
 
       // Data Shaping: Formatear ruta con coordenadas completas y geometría real
@@ -268,7 +352,7 @@ export class NimbusService {
       this.httpService.get(
         `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
         {
-          headers: { Authorization: token },
+          headers: { Authorization: `Token ${token}` },
           timeout: 30000,
         },
       ),
@@ -286,7 +370,7 @@ export class NimbusService {
         this.httpService.get(
           `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/routes`,
           {
-            headers: { Authorization: token },
+            headers: { Authorization: `Token ${token}` },
             timeout: 30000,
           },
         ),
@@ -304,7 +388,7 @@ export class NimbusService {
           this.httpService.get(
             `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
             {
-              headers: { Authorization: token },
+              headers: { Authorization: `Token ${token}` },
               timeout: 15000,
             },
           ),
@@ -316,13 +400,8 @@ export class NimbusService {
           `📊 Depot ${depot.id}: Encontrados ${rides.length} viajes activos`,
         );
 
-        // Mapear viajes activos por routeId para asignación de unidades
-        // CRÍTICO: Extraer unitId incondicionalmente, sin importar el estado del conductor
         for (const ride of rides) {
-          // Solo validar que exista tid (timetable ID) y u (unit ID)
-          // NO validar driver/conductor - puede estar vacío o null
           if (ride.tid && ride.u) {
-            // Buscar la ruta que contiene este timetable ID
             for (const route of routes) {
               if (route.tt && Array.isArray(route.tt)) {
                 const hasThisTimetable = route.tt.some(
@@ -338,24 +417,14 @@ export class NimbusService {
                     unitName,
                   });
 
-                  this.logger.log(
-                    `✅ Ruta ${route.n || route.id} (ID: ${routeKey}) → Unidad ${unitName} asignada (tid: ${ride.tid}, driver: ${ride.driver || 'Sin Asignar'})`,
-                  );
                   break;
                 }
               }
             }
           } else {
-            // Log de rides que no tienen tid o unitId
             if (!ride.tid) {
-              this.logger.warn(
-                `⚠️ Viaje sin timetable ID (tid) encontrado en depot ${depot.id}`,
-              );
             }
             if (!ride.u) {
-              this.logger.warn(
-                `⚠️ Viaje sin unidad (u) encontrado en depot ${depot.id} (tid: ${ride.tid || 'N/A'})`,
-              );
             }
           }
         }
@@ -365,11 +434,9 @@ export class NimbusService {
         );
       }
 
-      // Data Shaping: Formatear cada ruta con asignación de unidad si existe
       for (const rawRoute of routes) {
         const shapedRoute = this.shapeRoute(rawRoute, depot.id, stopsMap);
         if (shapedRoute) {
-          // Agregar asignación de unidad si existe un viaje activo
           const unitAssignment = activeRidesMap.get(String(rawRoute.id));
           if (unitAssignment) {
             shapedRoute.unitId = unitAssignment.unitId;
@@ -427,11 +494,13 @@ export class NimbusService {
 
       for (const adminDoc of adminsSnap.docs) {
         const companyData = adminDoc.data();
-        const nimbusToken = companyData.nimbusToken;
+        const rawNimbusToken = companyData.nimbusToken;
         const companyId = companyData.companyId || adminDoc.id;
 
-        if (!nimbusToken) continue;
-        const headers = { Authorization: nimbusToken };
+        if (!rawNimbusToken) continue;
+
+        const nimbusToken = rawNimbusToken.replace(/^Token\s+/i, '').trim();
+        const headers = { Authorization: `Token ${nimbusToken}` };
 
         try {
           const depotsResponse = await firstValueFrom(
@@ -564,12 +633,7 @@ export class NimbusService {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
   }
 
-  /**
-   * Calcula una ruta detallada usando Google Maps Directions API
-   * @param stops - Array de paradas con coordenadas lat/lng
-   * @returns EncodedPath con geometría detallada de Google Maps o undefined
-   */
-  private async calculateRouteWithGoogleMaps(
+  private async generateDirectionsEncodedPath(
     stops: DetailedStop[],
   ): Promise<string | undefined> {
     try {
@@ -579,20 +643,27 @@ export class NimbusService {
 
       const apiKey = this.configService.get<string>('GOOGLE_MAPS_API_KEY');
       if (!apiKey) {
+        this.logger.warn('⚠️ GOOGLE_MAPS_API_KEY no configurada');
         return undefined;
       }
 
-      // Preparar origen y destino
-      const origin = `${stops[0].lat},${stops[0].lng}`;
-      const destination = `${stops[stops.length - 1].lat},${stops[stops.length - 1].lng}`;
+      const validStops = stops.filter(
+        (s) => s.lat !== 0 && s.lng !== 0 && !isNaN(s.lat) && !isNaN(s.lng),
+      );
 
-      // Waypoints intermedios con prefijo via: para evitar vueltas en U
-      const waypoints = stops
-        .slice(1, -1)
-        .map((stop) => `via:${stop.lat},${stop.lng}`)
+      if (validStops.length < 2) {
+        return undefined;
+      }
+
+      const origin = `${validStops[0].lat},${validStops[0].lng}`;
+
+      const destination = `${validStops[validStops.length - 1].lat},${validStops[validStops.length - 1].lng}`;
+
+      const intermediateStops = validStops.slice(1, -1);
+      const waypoints = intermediateStops
+        .map((stop) => `${stop.lat},${stop.lng}`)
         .join('|');
 
-      // Construir URL de Google Directions API
       const params: any = {
         origin,
         destination,
@@ -600,34 +671,342 @@ export class NimbusService {
         key: apiKey,
       };
 
-      // Solo agregar waypoints si hay paradas intermedias
       if (waypoints) {
         params.waypoints = waypoints;
+        params.optimize = false;
       }
 
       const directionsUrl =
         'https://maps.googleapis.com/maps/api/directions/json';
 
+      this.logger.log(
+        `📍 Directions API: ${validStops.length} paradas (origin → ${intermediateStops.length} waypoints → destination)`,
+      );
+
       const response = await firstValueFrom(
-        this.httpService.get(directionsUrl, { params }),
+        this.httpService.get(directionsUrl, { params, timeout: 15000 }),
       );
 
       if (response.data.status !== 'OK') {
+        this.logger.error(
+          `❌ Google Directions API error: ${response.data.status} - ${response.data.error_message || 'Sin mensaje'}`,
+        );
         return undefined;
       }
 
-      // Extraer encoded polyline de la respuesta
       const route = response.data.routes[0];
-      if (
-        !route ||
-        !route.overview_polyline ||
-        !route.overview_polyline.points
-      ) {
+      if (!route?.overview_polyline?.points) {
+        this.logger.error(
+          '❌ Google Directions API no devolvió overview_polyline',
+        );
         return undefined;
       }
+
+      this.logger.log(
+        `✅ Directions API exitoso: encodedPath generado (${route.overview_polyline.points.length} caracteres)`,
+      );
 
       return route.overview_polyline.points;
+    } catch (error: any) {
+      const errorMsg =
+        error.response?.data?.error_message ||
+        error.message ||
+        'Error desconocido';
+      this.logger.error(`❌ Google Directions API falló: ${errorMsg}`);
+      return undefined;
+    }
+  }
+
+  private async snapToRoads(
+    coordinates: Array<{ lat: number; lng: number }>,
+    interpolate: boolean = true,
+  ): Promise<Array<{ lat: number; lng: number }> | undefined> {
+    try {
+      const apiKey = this.configService.get<string>('GOOGLE_MAPS_API_KEY');
+      if (!apiKey) {
+        this.logger.warn(
+          '⚠️ GOOGLE_MAPS_API_KEY no configurada para Snap to Roads',
+        );
+        return undefined;
+      }
+
+      if (!coordinates || coordinates.length < 2) {
+        return undefined;
+      }
+
+      const validCoords = coordinates.filter(
+        (c) => c.lat !== 0 && c.lng !== 0 && !isNaN(c.lat) && !isNaN(c.lng),
+      );
+
+      if (validCoords.length < 2) {
+        return undefined;
+      }
+
+      const BATCH_SIZE = 100;
+      const allSnappedPoints: Array<{ lat: number; lng: number }> = [];
+
+      for (let i = 0; i < validCoords.length; i += BATCH_SIZE - 1) {
+        const batch = validCoords.slice(i, i + BATCH_SIZE);
+
+        if (batch.length < 2) {
+          allSnappedPoints.push(...batch);
+          continue;
+        }
+
+        const pathString = batch.map((c) => `${c.lat},${c.lng}`).join('|');
+
+        const roadsUrl = 'https://roads.googleapis.com/v1/snapToRoads';
+        const params: any = {
+          path: pathString,
+          key: apiKey,
+        };
+
+        if (interpolate) {
+          params.interpolate = true;
+        }
+
+        try {
+          const response = await firstValueFrom(
+            this.httpService.get(roadsUrl, { params, timeout: 15000 }),
+          );
+
+          if (
+            response.data?.snappedPoints &&
+            response.data.snappedPoints.length > 0
+          ) {
+            const snappedBatch = response.data.snappedPoints.map(
+              (point: any) => ({
+                lat: point.location.latitude,
+                lng: point.location.longitude,
+              }),
+            );
+
+            // Evitar duplicar el punto de overlap entre batches
+            if (allSnappedPoints.length > 0 && i > 0) {
+              // Remover el primer punto del batch si es muy cercano al último agregado
+              const lastPoint = allSnappedPoints[allSnappedPoints.length - 1];
+              const firstBatchPoint = snappedBatch[0];
+              const distance = this.haversineDistance(
+                lastPoint.lat,
+                lastPoint.lng,
+                firstBatchPoint.lat,
+                firstBatchPoint.lng,
+              );
+
+              if (distance < 10) {
+                // Menos de 10 metros, es el mismo punto
+                snappedBatch.shift();
+              }
+            }
+
+            allSnappedPoints.push(...snappedBatch);
+          } else {
+            // Si falla el snap, agregar puntos originales
+            this.logger.warn(
+              `⚠️ Snap to Roads no devolvió puntos para batch ${i / BATCH_SIZE}`,
+            );
+            if (allSnappedPoints.length > 0) {
+              batch.shift(); // Evitar duplicar overlap
+            }
+            allSnappedPoints.push(...batch);
+          }
+        } catch (batchError: any) {
+          this.logger.warn(
+            `⚠️ Error en batch ${i / BATCH_SIZE} de Snap to Roads: ${batchError.message}`,
+          );
+          // Agregar puntos originales como fallback
+          if (allSnappedPoints.length > 0) {
+            batch.shift();
+          }
+          allSnappedPoints.push(...batch);
+        }
+
+        // Pequeña pausa entre batches para evitar rate limiting
+        if (i + BATCH_SIZE < validCoords.length) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+
+      if (allSnappedPoints.length >= 2) {
+        this.logger.log(
+          `✅ Snap to Roads completado: ${validCoords.length} puntos → ${allSnappedPoints.length} puntos ajustados`,
+        );
+        return allSnappedPoints;
+      }
+
+      return undefined;
+    } catch (error: any) {
+      this.logger.error(`❌ Error en Snap to Roads: ${error.message}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Calcula la distancia en metros entre dos coordenadas usando la fórmula de Haversine
+   */
+  private haversineDistance(
+    lat1: number,
+    lng1: number,
+    lat2: number,
+    lng2: number,
+  ): number {
+    const R = 6371000; // Radio de la Tierra en metros
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLng = ((lng2 - lng1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLng / 2) *
+        Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  /**
+   * Extrae puntos del path/shape de Nimbus para procesarlos con Snap to Roads
+   * @param rawRoute - Ruta cruda de Nimbus
+   * @returns Array de coordenadas extraídas del path de Nimbus
+   */
+  private extractPathPointsFromNimbus(
+    rawRoute: any,
+  ): Array<{ lat: number; lng: number }> {
+    const points: Array<{ lat: number; lng: number }> = [];
+
+    try {
+      // PRIORIDAD 1: Shape/path codificado de Nimbus
+      if (rawRoute.shape && typeof rawRoute.shape === 'string') {
+        const decoded = polyline.decode(rawRoute.shape);
+        return decoded.map((coord: [number, number]) => ({
+          lat: coord[0],
+          lng: coord[1],
+        }));
+      }
+
+      if (rawRoute.path && typeof rawRoute.path === 'string') {
+        const decoded = polyline.decode(rawRoute.path);
+        return decoded.map((coord: [number, number]) => ({
+          lat: coord[0],
+          lng: coord[1],
+        }));
+      }
+
+      // PRIORIDAD 2: Fragmentos de path en cada parada (st[i].p)
+      if (rawRoute.st && Array.isArray(rawRoute.st)) {
+        for (const stop of rawRoute.st) {
+          if (stop.p && typeof stop.p === 'string' && stop.p.length > 0) {
+            try {
+              const decoded = polyline.decode(stop.p);
+              points.push(
+                ...decoded.map((coord: [number, number]) => ({
+                  lat: coord[0],
+                  lng: coord[1],
+                })),
+              );
+            } catch {
+              // Ignorar fragmentos inválidos
+            }
+          }
+        }
+
+        if (points.length > 0) {
+          return points;
+        }
+      }
+
+      // PRIORIDAD 3: Array de puntos 'p'
+      if (rawRoute.p && Array.isArray(rawRoute.p)) {
+        return rawRoute.p
+          .filter((pt: any) => (pt.y || pt.lat) && (pt.x || pt.lon))
+          .map((pt: any) => ({
+            lat: pt.y || pt.lat,
+            lng: pt.x || pt.lon,
+          }));
+      }
+
+      // PRIORIDAD 4: Array de puntos genérico
+      if (rawRoute.points && Array.isArray(rawRoute.points)) {
+        return rawRoute.points
+          .filter((pt: any) => (pt.y || pt.lat) && (pt.x || pt.lon))
+          .map((pt: any) => ({
+            lat: pt.y || pt.lat,
+            lng: pt.x || pt.lon,
+          }));
+      }
     } catch (error) {
+      this.logger.warn('⚠️ Error extrayendo puntos de path de Nimbus');
+    }
+
+    return points;
+  }
+
+  /**
+   * Genera encodedPath profesional usando Snap to Roads de Google
+   * Procesa rutas bidireccionales (ida y vuelta) para flechas direccionales
+   * @param rawRoute - Ruta cruda de Nimbus
+   * @param stops - Paradas con coordenadas
+   * @returns EncodedPath ajustado a calles reales
+   */
+  private async generateSnapToRoadsEncodedPath(
+    rawRoute: any,
+    stops: DetailedStop[],
+  ): Promise<string | undefined> {
+    try {
+      // 1. Extraer puntos del path de Nimbus
+      let pathPoints = this.extractPathPointsFromNimbus(rawRoute);
+
+      // 2. Si no hay path de Nimbus, usar las paradas como puntos base
+      if (pathPoints.length < 2 && stops.length >= 2) {
+        pathPoints = stops
+          .filter((s) => s.lat !== 0 && s.lng !== 0)
+          .map((s) => ({ lat: s.lat, lng: s.lng }));
+      }
+
+      if (pathPoints.length < 2) {
+        return undefined;
+      }
+
+      // 3. Detectar si es ruta bidireccional (ida y vuelta)
+      // Comparar primer y último punto para determinar si es circular
+      const firstPoint = pathPoints[0];
+      const lastPoint = pathPoints[pathPoints.length - 1];
+      const isRoundTrip =
+        this.haversineDistance(
+          firstPoint.lat,
+          firstPoint.lng,
+          lastPoint.lat,
+          lastPoint.lng,
+        ) < 500; // Menos de 500m = probablemente circular
+
+      // 4. Aplicar Snap to Roads
+      const snappedPoints = await this.snapToRoads(pathPoints, true);
+
+      if (!snappedPoints || snappedPoints.length < 2) {
+        return undefined;
+      }
+
+      // 5. Si es ruta bidireccional, procesar ambos sentidos
+      if (isRoundTrip && rawRoute.returnPath) {
+        // Si Nimbus provee path de retorno explícito
+        const returnPathPoints = this.extractPathPointsFromNimbus({
+          path: rawRoute.returnPath,
+        });
+
+        if (returnPathPoints.length >= 2) {
+          const snappedReturn = await this.snapToRoads(returnPathPoints, true);
+          if (snappedReturn && snappedReturn.length >= 2) {
+            // Combinar ida y vuelta
+            snappedPoints.push(...snappedReturn);
+          }
+        }
+      }
+
+      // 6. Codificar a polyline
+      return this.encodePolyline(snappedPoints);
+    } catch (error: any) {
+      this.logger.error(
+        `❌ Error generando Snap to Roads encodedPath: ${error.message}`,
+      );
       return undefined;
     }
   }
@@ -759,7 +1138,7 @@ export class NimbusService {
         this.httpService.get(
           `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stops`,
           {
-            headers: { Authorization: token },
+            headers: { Authorization: `Token ${token}` },
             params: { flags: 1 }, // Solicitar datos completos incluyendo coordenadas
             timeout: 20000, // 20 segundos para evitar abortos de stream
           },
@@ -921,9 +1300,6 @@ export class NimbusService {
 
         // Log de advertencia si no se encuentra el nombre en stopsMap
         if (!stopData && !stop.n && !stop.name) {
-          this.logger.warn(
-            `⚠️ Parada ${stopId} no encontrada en stopsMap para depot ${depotId}`,
-          );
         }
 
         return {
@@ -944,26 +1320,21 @@ export class NimbusService {
         ? detailedStops[detailedStops.length - 1].name
         : 'Sin destino';
 
-    // Generar encodedPath con Google Maps Directions API para precisión GPS profesional
+    // Generar encodedPath profesional con Google Directions API
     let encodedPath: string | undefined;
 
-    // PRIORIDAD 1: Google Maps Directions API (precisión GPS profesional)
+    // PRIORIDAD 1: Google Directions API (polilínea perfecta siguiendo calles)
+    // Usa las paradas como origin, destination y waypoints
     if (detailedStops.length >= 2) {
-      encodedPath = await this.calculateRouteWithGoogleMaps(detailedStops);
+      encodedPath = await this.generateDirectionsEncodedPath(detailedStops);
     }
 
-    // PRIORIDAD 2 (FALLBACK): Intentar shape/path de Nimbus si Google falla
+    // PRIORIDAD 2 (FALLBACK): Unir puntos con líneas rectas
+    // Si Google falla (error 403, límite de API, etc.), no romper la app
     if (!encodedPath) {
-      encodedPath = this.extractEncodedPath(rawRoute);
-    }
-
-    // PRIORIDAD 3 (FALLBACK): Wialon routing service
-    if (!encodedPath && detailedStops.length >= 2) {
-      encodedPath = await this.calculateRouteWithWialon(detailedStops);
-    }
-
-    // PRIORIDAD 4 (Último RECURSO): Unir puntos manualmente (líneas rectas)
-    if (!encodedPath) {
+      this.logger.warn(
+        '⚠️ Google Directions API falló, generando líneas rectas entre paradas',
+      );
       const coordinates = detailedStops
         .filter((stop) => stop.lat !== 0 && stop.lng !== 0)
         .map((stop) => ({ lat: stop.lat, lng: stop.lng }));
@@ -1315,7 +1686,6 @@ export class NimbusService {
         const unitData = unitResponse.data.item;
 
         if (!unitData || unitResponse.data.error) {
-          this.logger.warn(`⚠️ Unidad ${unitId} no encontrada en Wialon`);
           throw new BadRequestException(`Unidad ${unitId} no encontrada`);
         }
 

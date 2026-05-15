@@ -14,5 +14,6 @@ import { NimbusController } from './nimbus.controller';
   ],
   controllers: [NimbusController],
   providers: [NimbusService],
+  exports: [NimbusService],
 })
 export class NimbusModule {}

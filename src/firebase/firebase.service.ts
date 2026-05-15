@@ -34,9 +34,6 @@ export class FirebaseService implements OnModuleInit {
 
         credential = admin.credential.cert(serviceAccount);
         authMethod = 'Variable de entorno FIREBASE_SERVICE_ACCOUNT_JSON';
-        this.logger.log(
-          '✅ private_key procesada correctamente (\\n → saltos de línea)',
-        );
       } catch (error) {
         this.logger.error('❌ Error parseando FIREBASE_SERVICE_ACCOUNT_JSON');
         this.logger.error(`Detalles del error: ${error.message}`);
@@ -67,8 +64,6 @@ export class FirebaseService implements OnModuleInit {
       credential = admin.credential.applicationDefault();
       authMethod = 'Application Default Credentials (gcloud)';
     }
-
-    this.logger.log(`🔐 Autenticación Firebase: ${authMethod}`);
 
     // Inicializar Firebase Admin
     this.app = admin.initializeApp({

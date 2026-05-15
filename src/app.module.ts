@@ -7,6 +7,8 @@ import { AppService } from './app.service';
 import { WialonModule } from './wialon/wialon.module';
 import { FirebaseModule } from './firebase/firebase.module';
 import { NimbusModule } from './nimbus/nimbus.module';
+import { DriverModule } from './driver/driver.module';
+import { PassengerModule } from './passenger/passenger.module';
 import { ConfigModule } from '@nestjs/config';
 import { FirebaseAuthGuard } from './firebase/guards/firebase-auth.guard';
 
@@ -17,6 +19,8 @@ import { FirebaseAuthGuard } from './firebase/guards/firebase-auth.guard';
     FirebaseModule,
     WialonModule,
     NimbusModule,
+    DriverModule,
+    PassengerModule,
   ],
   controllers: [AppController],
   providers: [
