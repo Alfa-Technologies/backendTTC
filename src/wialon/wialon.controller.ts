@@ -16,4 +16,9 @@ export class WialonController {
   async getUnits(@CurrentUser() user: any) {
     return this.wialonService.getUnits(user.uid);
   }
+
+  @Get('positions')
+  async getPositions(@CurrentUser() user: any) {
+    return this.wialonService.getPositions(user.uid);
+  }
 }

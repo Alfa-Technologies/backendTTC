@@ -2,15 +2,23 @@ import { IsString, IsNotEmpty, IsOptional } from 'class-validator';
 
 export class EndShiftDto {
   @IsString()
-  @IsNotEmpty({ message: 'El companyId es requerido' })
-  companyId: string;
+  @IsNotEmpty({ message: 'El shiftId es requerido' })
+  shiftId: string;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty({ message: 'El unitId es requerido' })
-  unitId: string;
+  driverId?: string;
 
-  @IsNotEmpty({ message: 'El rideId es requerido' })
-  rideId: string | number;
+  @IsOptional()
+  @IsString()
+  companyId?: string;
+
+  @IsOptional()
+  @IsString()
+  unitId?: string;
+
+  @IsOptional()
+  rideId?: string | number;
 
   @IsOptional()
   depotId?: number | string;

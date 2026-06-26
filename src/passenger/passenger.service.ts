@@ -4,6 +4,14 @@ import { DriverService } from '../driver/driver.service';
 import { NimbusService } from '../nimbus/nimbus.service';
 import { firstValueFrom } from 'rxjs';
 import { HttpService } from '@nestjs/axios';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const MX_TIMEZONE = 'America/Monterrey';
 
 @Injectable()
 export class PassengerService {
@@ -93,9 +101,11 @@ export class PassengerService {
         }
       }
 
-      // 4. Buscar viaje activo para el routeId
-      let activeRide: any = null;
+      // 4. Buscar viaje activo o próximo para el routeId usando jerarquía de tiempo
+      let selectedRide: any = null;
       let foundDepotId: number | null = null;
+      let isActiveNow = false;
+      const currentUnix = dayjs().unix();
 
       for (const depot of depots) {
         if (!depot.id) continue;
@@ -109,33 +119,62 @@ export class PassengerService {
           );
           const rides = ridesResponse.data.rides || [];
 
-          // Filtrar rides que tengan unidad asignada (campo u no nulo, no vacío)
-          const validRides = rides.filter(
-            (ride: any) => ride.u && String(ride.u).trim() !== '',
+          // Buscar rides que coincidan con el routeId (por tid o directamente)
+          const tid = routeToTidMap.get(String(routeId));
+          const matchingRides = rides.filter(
+            (r: any) =>
+              (tid && String(r.tid) === tid) ||
+              String(r.routeId) === String(routeId) ||
+              String(r.id) === String(routeId),
           );
 
-          // Buscar ride cuyo tid coincida con el routeId
-          const tid = routeToTidMap.get(String(routeId));
-          if (tid) {
-            const ride = validRides.find((r: any) => String(r.tid) === tid);
-            if (ride) {
-              activeRide = ride;
+          if (matchingRides.length === 0) continue;
+
+          // Paso A: Buscar viaje ACTIVO (hora actual dentro del rango inicio-fin)
+          for (const ride of matchingRides) {
+            if (!ride.pt || !Array.isArray(ride.pt) || ride.pt.length < 2)
+              continue;
+            const startUnix = Number(ride.pt[0]);
+            const endUnix = Number(ride.pt[ride.pt.length - 1]);
+
+            if (currentUnix >= startUnix && currentUnix <= endUnix) {
+              selectedRide = ride;
               foundDepotId = depot.id;
+              isActiveNow = true;
+              this.logger.log(
+                `✅ Viaje ACTIVO encontrado: ${ride.id} (${dayjs.unix(startUnix).tz(MX_TIMEZONE).format('HH:mm')} - ${dayjs.unix(endUnix).tz(MX_TIMEZONE).format('HH:mm')})`,
+              );
               break;
             }
           }
 
-          // Fallback: buscar ride que coincida directamente con routeId en algún campo
-          if (!activeRide) {
-            const ride = validRides.find(
-              (r: any) =>
-                String(r.routeId) === String(routeId) ||
-                String(r.id) === String(routeId),
-            );
-            if (ride) {
-              activeRide = ride;
+          // Si ya encontramos viaje activo, salir del loop de depots
+          if (selectedRide && isActiveNow) break;
+
+          // Paso B: Si no hay viaje activo, buscar el viaje más próximo en el futuro
+          if (!selectedRide) {
+            let closestFutureRide: any = null;
+            let closestStartUnix = Infinity;
+
+            for (const ride of matchingRides) {
+              if (!ride.pt || !Array.isArray(ride.pt) || ride.pt.length < 2)
+                continue;
+              const startUnix = Number(ride.pt[0]);
+
+              // Solo considerar viajes futuros
+              if (startUnix > currentUnix && startUnix < closestStartUnix) {
+                closestFutureRide = ride;
+                closestStartUnix = startUnix;
+              }
+            }
+
+            if (closestFutureRide) {
+              selectedRide = closestFutureRide;
               foundDepotId = depot.id;
-              break;
+              isActiveNow = false;
+              this.logger.log(
+                `📅 Viaje PRÓXIMO encontrado: ${closestFutureRide.id} (inicia a las ${dayjs.unix(closestStartUnix).tz(MX_TIMEZONE).format('HH:mm')})`,
+              );
             }
           }
         } catch (error) {
@@ -145,13 +184,24 @@ export class PassengerService {
         }
       }
 
-      // 5. Si no hay viaje activo, retornar isActive: false
-      if (!activeRide) {
-        this.logger.log(`No se encontró viaje activo para routeId ${routeId}`);
+      // 5. Si no hay viaje activo ni próximo, retornar currentStatus con valores nulos
+      if (!selectedRide) {
+        this.logger.log(
+          `No se encontró viaje activo ni próximo para routeId ${routeId}`,
+        );
         return {
           isActive: false,
+          currentStatus: {
+            activeRideId: null,
+            unitName: null,
+            unitId: null,
+            isActiveNow: false,
+          },
         };
       }
+
+      // Alias para mantener compatibilidad con el código existente
+      const activeRide = selectedRide;
 
       // 6. Calcular hasPassed si se proporciona targetStopId
       let hasPassed = false;
@@ -162,10 +212,11 @@ export class PassengerService {
         }
       }
 
-      // 7. Obtener ubicación de la unidad desde Wialon
-      const unitId = String(activeRide.u || '');
+      // 7. Obtener ubicación y nombre de la unidad desde Wialon
+      const unitId = activeRide.u ? String(activeRide.u) : null;
       let unitLat = 0;
       let unitLng = 0;
+      let unitName: string | null = null;
 
       if (unitId) {
         try {
@@ -173,6 +224,7 @@ export class PassengerService {
           if (location.success) {
             unitLat = location.lat;
             unitLng = location.lng;
+            unitName = location.unitName || `U ${unitId}`;
           }
         } catch (error) {
           this.logger.warn(
@@ -196,10 +248,16 @@ export class PassengerService {
         }
       }
 
-      // 9. Formatear respuesta
+      // 9. Formatear respuesta con currentStatus
       return {
-        isActive: true,
-        unitName: `U ${unitId}`,
+        isActive: isActiveNow,
+        currentStatus: {
+          activeRideId: String(activeRide.id),
+          unitName: unitName,
+          unitId: unitId,
+          isActiveNow: isActiveNow,
+        },
+        unitName: unitName || (unitId ? `U ${unitId}` : null),
         location: {
           latitude: unitLat,
           longitude: unitLng,

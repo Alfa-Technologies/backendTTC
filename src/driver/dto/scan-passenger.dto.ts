@@ -4,6 +4,7 @@ import {
   IsOptional,
   IsNumber,
   IsDateString,
+  Allow,
 } from 'class-validator';
 
 export class ScanPassengerDto {
@@ -24,6 +25,14 @@ export class ScanPassengerDto {
   rideId: string;
 
   @IsOptional()
+  @IsString()
+  shiftId?: string;
+
+  @IsOptional()
+  @IsString()
+  passengerName?: string;
+
+  @IsOptional()
   @IsDateString()
   scannedAt?: string;
 
@@ -31,7 +40,27 @@ export class ScanPassengerDto {
   @IsNumber()
   stopIndex?: number;
 
+  @IsOptional()
+  @IsString()
+  stopName?: string;
+
   @IsString()
   @IsNotEmpty({ message: 'El unitId es requerido' })
   unitId: string;
+
+  @IsOptional()
+  @IsNumber()
+  lat?: number;
+
+  @IsOptional()
+  @IsNumber()
+  lng?: number;
+
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
 }

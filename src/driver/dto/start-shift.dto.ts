@@ -1,6 +1,16 @@
-import { IsString, IsNotEmpty, IsNumber } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  Allow,
+} from 'class-validator';
 
 export class StartShiftDto {
+  @IsString()
+  @IsNotEmpty({ message: 'El driverId es requerido' })
+  driverId: string;
+
   @IsString()
   @IsNotEmpty({ message: 'El companyId es requerido' })
   companyId: string;
@@ -19,4 +29,36 @@ export class StartShiftDto {
   @IsNumber()
   @IsNotEmpty({ message: 'El routeId es requerido' })
   routeId: number;
+
+  @IsOptional()
+  @IsString()
+  routeName?: string;
+
+  @IsOptional()
+  @Allow()
+  stops?: Record<string, any>[];
+
+  @IsOptional()
+  @IsNumber()
+  stopsCount?: number;
+
+  @IsOptional()
+  @IsString()
+  unitName?: string;
+
+  @IsOptional()
+  @IsNumber()
+  capacity?: number;
+
+  @IsOptional()
+  @IsString()
+  encodedPath?: string;
+
+  @IsOptional()
+  @Allow()
+  timeRange?: string;
+
+  @IsOptional()
+  @Allow()
+  driverName?: string;
 }

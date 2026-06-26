@@ -7,6 +7,10 @@ export class UpdateLocationDto {
   @IsOptional()
   rideId?: string | number;
 
+  @IsOptional()
+  @IsString()
+  shiftId?: string;
+
   @IsNumber()
   latitude: number;
 
@@ -28,6 +32,10 @@ export class UpdateLocationDto {
   @IsOptional()
   @IsNumber()
   stopIndex?: number;
+
+  @IsOptional()
+  @IsNumber()
+  currentStopIndex?: number;
 
   @IsOptional()
   @IsNumber()

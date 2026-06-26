@@ -21,6 +21,8 @@ import {
   DetailedStop,
   RouteDetailResponse,
 } from './interfaces/route.interface';
+import { CreateRouteDto } from './dto/create-route.dto';
+import { UpdateRouteDto } from './dto/update-route.dto';
 
 export interface StopDetail {
   id: number;
@@ -37,6 +39,13 @@ export class NimbusService {
     { map: Map<number, StopDetail>; timestamp: number }
   > = new Map();
   private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutos en milisegundos
+
+  // Google Directions acepta como máximo ~25 puntos por petición
+  // (origin + destination + 23 waypoints). Rutas más largas se dividen en tramos.
+  private static readonly MAX_POINTS_PER_REQUEST = 25;
+
+  // Subir este número invalida los trazados cacheados (se regeneran al pedirlos).
+  private static readonly GEOMETRY_VERSION = 2;
 
   constructor(
     private readonly httpService: HttpService,
@@ -76,35 +85,15 @@ export class NimbusService {
   }
 
   public async getNimbusToken(uid: string): Promise<string> {
-    const db = this.firebaseService.getFirestore();
-
-    const userDoc = await db.collection('users').doc(uid).get();
-    const userData = userDoc.data();
-
-    const rawToken = userData?.nimbusToken;
-    if (rawToken) {
-      return rawToken.replace(/^Token\s+/i, '').trim();
+    // Resolución multi-tenant unificada: token propio -> proveedor (companies
+    // -> adminUid) -> settings/ttc para super_admin. Ver FirebaseService.
+    const token = await this.firebaseService.resolveProviderToken(uid, 'nimbus');
+    if (!token) {
+      throw new BadRequestException(
+        'El usuario no tiene token de Nimbus configurado.',
+      );
     }
-
-    // Passenger: look up the token from their company's admin
-    const companyId = userData?.companyId;
-    if (companyId) {
-      const adminSnap = await db
-        .collection('users')
-        .where('role', '==', 'Business Admin')
-        .where('companyId', '==', companyId)
-        .limit(1)
-        .get();
-
-      const companyToken = adminSnap.docs[0]?.data()?.nimbusToken;
-      if (companyToken) {
-        return companyToken.replace(/^Token\s+/i, '').trim();
-      }
-    }
-
-    throw new BadRequestException(
-      'El usuario no tiene token de Nimbus configurado.',
-    );
+    return token;
   }
 
   async getStopDetails(uid: string, depotId: string, stopId: string) {
@@ -389,8 +378,9 @@ export class NimbusService {
             `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
             {
               headers: { Authorization: `Token ${token}` },
-              timeout: 15000,
-            },
+              timeout: 8000,
+              'axios-retry': { retries: 0 },
+            } as any,
           ),
         );
 
@@ -451,11 +441,38 @@ export class NimbusService {
       }
     }
 
+    // Filtrado por Cliente (plantId): si el usuario pertenece a un Cliente,
+    // solo ve las rutas asignadas a ese Cliente (plants/{plantId}.routeIds).
+    // Usuarios sin plantId (admin de proveedor, monitorista, conductor) ven todas.
+    const visibleRoutes = await this.filterRoutesByPlant(uid, shapedRoutes);
+
     return {
       success: true,
-      routes: shapedRoutes,
-      totalRoutes: shapedRoutes.length,
+      routes: visibleRoutes,
+      totalRoutes: visibleRoutes.length,
     };
+  }
+
+  /**
+   * Si users/{uid} tiene plantId, devuelve solo las rutas cuyo id esté en
+   * plants/{plantId}.routeIds (puede quedar vacío). Sin plantId, devuelve todas.
+   */
+  private async filterRoutesByPlant(
+    uid: string,
+    routes: ShapedRoute[],
+  ): Promise<ShapedRoute[]> {
+    const db = this.firebaseService.getFirestore();
+    const userSnap = await db.collection('users').doc(uid).get();
+    const plantId = userSnap.data()?.plantId as string | undefined;
+    if (!plantId) return routes;
+
+    const plantSnap = await db.collection('plants').doc(plantId).get();
+    const rawIds = plantSnap.data()?.routeIds;
+    const allowed = new Set<number>(
+      (Array.isArray(rawIds) ? rawIds : []).map((v: any) => Number(v)),
+    );
+
+    return routes.filter((r) => allowed.has(Number(r.id)));
   }
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -633,88 +650,127 @@ export class NimbusService {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
   }
 
+  // Pide Google Directions para un tramo (<=25 paradas) y devuelve las
+  // coordenadas de ALTA RESOLUCIÓN (concatenando los steps). [] si falla.
+  private async fetchHighResCoordsForChunk(
+    chunk: DetailedStop[],
+  ): Promise<Array<[number, number]>> {
+    if (chunk.length < 2) return [];
+
+    const apiKey = this.configService.get<string>('GOOGLE_MAPS_API_KEY');
+    if (!apiKey) {
+      this.logger.warn('⚠️ GOOGLE_MAPS_API_KEY no configurada');
+      return [];
+    }
+
+    const origin = `${chunk[0].lat},${chunk[0].lng}`;
+    const destination = `${chunk[chunk.length - 1].lat},${chunk[chunk.length - 1].lng}`;
+    const intermediate = chunk.slice(1, -1);
+    const waypoints = intermediate.map((s) => `${s.lat},${s.lng}`).join('|');
+
+    const params: any = { origin, destination, mode: 'driving', key: apiKey };
+    if (waypoints) {
+      params.waypoints = waypoints;
+      params.optimize = false;
+    }
+
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(
+          'https://maps.googleapis.com/maps/api/directions/json',
+          { params, timeout: 15000 },
+        ),
+      );
+      if (response.data.status !== 'OK') {
+        this.logger.warn(
+          `⚠️ Directions tramo status=${response.data.status}: ${response.data.error_message || 'sin mensaje'}`,
+        );
+        return [];
+      }
+      const route = response.data.routes?.[0];
+      const coords: Array<[number, number]> = [];
+      for (const leg of route?.legs ?? []) {
+        for (const step of leg?.steps ?? []) {
+          const encoded = step?.polyline?.points;
+          if (!encoded || typeof encoded !== 'string') continue;
+          let decoded: Array<[number, number]>;
+          try {
+            decoded = polyline.decode(encoded);
+          } catch {
+            continue;
+          }
+          for (const c of decoded) {
+            const last = coords[coords.length - 1];
+            if (last && last[0] === c[0] && last[1] === c[1]) continue;
+            coords.push(c);
+          }
+        }
+      }
+      // Fallback dentro del tramo: si no hubo steps, usar overview simplificado,
+      // anclando inicio y fin a las coordenadas EXACTAS de las paradas del tramo
+      // para que la unión entre tramos no muestre saltos.
+      if (coords.length < 2 && route?.overview_polyline?.points) {
+        try {
+          const decoded = polyline.decode(route.overview_polyline.points) as Array<[number, number]>;
+          if (decoded.length >= 2) {
+            decoded[0] = [chunk[0].lat, chunk[0].lng];
+            decoded[decoded.length - 1] = [chunk[chunk.length - 1].lat, chunk[chunk.length - 1].lng];
+            return decoded;
+          }
+          return [];
+        } catch {
+          return [];
+        }
+      }
+      return coords;
+    } catch (error: any) {
+      const msg = error.response?.data?.error_message || error.message || 'error';
+      this.logger.warn(`⚠️ Directions tramo falló: ${msg}`);
+      return [];
+    }
+  }
+
   private async generateDirectionsEncodedPath(
     stops: DetailedStop[],
   ): Promise<string | undefined> {
-    try {
-      if (stops.length < 2) {
-        return undefined;
+    const validStops = stops.filter(
+      (s) => s.lat !== 0 && s.lng !== 0 && !isNaN(s.lat) && !isNaN(s.lng),
+    );
+    if (validStops.length < 2) return undefined;
+
+    const MAX = NimbusService.MAX_POINTS_PER_REQUEST;
+
+    // Dividir en tramos consecutivos de <=MAX paradas, con solape de 1
+    // (el destino de un tramo es el origen del siguiente) para continuidad.
+    const chunks: DetailedStop[][] = [];
+    for (let i = 0; i < validStops.length - 1; i += MAX - 1) {
+      chunks.push(validStops.slice(i, i + MAX));
+    }
+
+    this.logger.log(
+      `📍 Directions API: ${validStops.length} paradas en ${chunks.length} tramo(s)`,
+    );
+
+    const allCoords: Array<[number, number]> = [];
+    for (const chunk of chunks) {
+      const coords = await this.fetchHighResCoordsForChunk(chunk);
+      for (const c of coords) {
+        const last = allCoords[allCoords.length - 1];
+        if (last && last[0] === c[0] && last[1] === c[1]) continue; // evita duplicar solape
+        allCoords.push(c);
       }
+    }
 
-      const apiKey = this.configService.get<string>('GOOGLE_MAPS_API_KEY');
-      if (!apiKey) {
-        this.logger.warn('⚠️ GOOGLE_MAPS_API_KEY no configurada');
-        return undefined;
-      }
-
-      const validStops = stops.filter(
-        (s) => s.lat !== 0 && s.lng !== 0 && !isNaN(s.lat) && !isNaN(s.lng),
-      );
-
-      if (validStops.length < 2) {
-        return undefined;
-      }
-
-      const origin = `${validStops[0].lat},${validStops[0].lng}`;
-
-      const destination = `${validStops[validStops.length - 1].lat},${validStops[validStops.length - 1].lng}`;
-
-      const intermediateStops = validStops.slice(1, -1);
-      const waypoints = intermediateStops
-        .map((stop) => `${stop.lat},${stop.lng}`)
-        .join('|');
-
-      const params: any = {
-        origin,
-        destination,
-        mode: 'driving',
-        key: apiKey,
-      };
-
-      if (waypoints) {
-        params.waypoints = waypoints;
-        params.optimize = false;
-      }
-
-      const directionsUrl =
-        'https://maps.googleapis.com/maps/api/directions/json';
-
-      this.logger.log(
-        `📍 Directions API: ${validStops.length} paradas (origin → ${intermediateStops.length} waypoints → destination)`,
-      );
-
-      const response = await firstValueFrom(
-        this.httpService.get(directionsUrl, { params, timeout: 15000 }),
-      );
-
-      if (response.data.status !== 'OK') {
-        this.logger.error(
-          `❌ Google Directions API error: ${response.data.status} - ${response.data.error_message || 'Sin mensaje'}`,
-        );
-        return undefined;
-      }
-
-      const route = response.data.routes[0];
-      if (!route?.overview_polyline?.points) {
-        this.logger.error(
-          '❌ Google Directions API no devolvió overview_polyline',
-        );
-        return undefined;
-      }
-
-      this.logger.log(
-        `✅ Directions API exitoso: encodedPath generado (${route.overview_polyline.points.length} caracteres)`,
-      );
-
-      return route.overview_polyline.points;
-    } catch (error: any) {
-      const errorMsg =
-        error.response?.data?.error_message ||
-        error.message ||
-        'Error desconocido';
-      this.logger.error(`❌ Google Directions API falló: ${errorMsg}`);
+    if (allCoords.length < 2) {
+      this.logger.warn('⚠️ Directions no produjo geometría para ningún tramo');
       return undefined;
     }
+
+    const encodedPath = polyline.encode(allCoords);
+    this.logger.log(
+      `✅ Directions alta resolución: ${allCoords.length} puntos (${encodedPath.length} chars)`,
+    );
+    return encodedPath;
   }
 
   private async snapToRoads(
@@ -1020,19 +1076,21 @@ export class NimbusService {
     stops: DetailedStop[],
   ): Promise<string | undefined> {
     try {
-      // Obtener token de Wialon desde Firebase (usar el primer usuario admin)
+      // Obtener token de Wialon desde Firebase (cualquier proveedor con token).
+      // Acepta el rol nuevo (business_admin) y el legacy (Business Admin).
       const db = this.firebaseService.getFirestore();
       const adminsSnap = await db
         .collection('users')
-        .where('role', '==', 'Business Admin')
-        .limit(1)
+        .where('role', 'in', ['business_admin', 'Business Admin'])
         .get();
 
       if (adminsSnap.empty) {
         return undefined;
       }
 
-      const wialonToken = adminsSnap.docs[0].data()?.wialonToken;
+      const wialonToken = adminsSnap.docs
+        .map((d) => d.data()?.wialonToken)
+        .find((t) => typeof t === 'string' && t.trim());
       if (!wialonToken) {
         return undefined;
       }
@@ -1271,6 +1329,94 @@ export class NimbusService {
   }
 
   /**
+   * Calcula un hash determinístico de las coordenadas de las paradas para
+   * detectar cambios en la geometría de la ruta. Usa djb2 sobre la cadena
+   * "lat,lng|lat,lng|..." con coordenadas redondeadas a 5 decimales.
+   */
+  private computeStopsHash(stops: DetailedStop[]): string {
+    const signature = stops
+      .map((s) => `${s.lat.toFixed(5)},${s.lng.toFixed(5)}`)
+      .join('|');
+
+    let hash = 5381;
+    for (let i = 0; i < signature.length; i++) {
+      hash = (hash * 33) ^ signature.charCodeAt(i);
+    }
+    // Convertir a entero sin signo y a base 36 para una clave compacta
+    return (hash >>> 0).toString(36);
+  }
+
+  /**
+   * Obtiene el encodedPath de alta resolución desde el caché de Firestore, o lo
+   * genera con Google Directions y lo persiste. Regenera si las paradas
+   * cambiaron (hash distinto) o si el caché expiró (TTL 30 días).
+   * @param depotId - ID del depot
+   * @param routeId - ID de la ruta
+   * @param stops - Paradas con coordenadas
+   * @returns encodedPath de alta resolución o undefined
+   */
+  private async getOrGenerateRouteGeometry(
+    depotId: number,
+    routeId: number,
+    stops: DetailedStop[],
+  ): Promise<string | undefined> {
+    const TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días
+    const docId = `${depotId}_${routeId}`;
+    const stopsHash = this.computeStopsHash(stops);
+    const db = this.firebaseService.getFirestore();
+    const docRef = db.collection('route_geometry').doc(docId);
+
+    // 1. Intentar leer del caché (tolerante a fallos)
+    try {
+      const snap = await docRef.get();
+      if (snap.exists) {
+        const data = snap.data();
+        const isFresh =
+          data?.generatedAt &&
+          Date.now() - data.generatedAt < TTL_MS;
+        const hashMatches = data?.stopsHash === stopsHash;
+        const versionMatches =
+          data?.geometryVersion === NimbusService.GEOMETRY_VERSION;
+
+        if (data?.encodedPath && isFresh && hashMatches && versionMatches) {
+          this.logger.log(
+            `🗺️ route_geometry HIT ${docId} (${data.pointCount || '?'} puntos)`,
+          );
+          return data.encodedPath as string;
+        }
+      }
+    } catch (cacheError: any) {
+      this.logger.warn(
+        `⚠️ No se pudo leer route_geometry/${docId}: ${cacheError.message}. Generando en vivo.`,
+      );
+    }
+
+    // 2. Generar con Google Directions (alta resolución)
+    const encodedPath = await this.generateDirectionsEncodedPath(stops);
+    if (!encodedPath) {
+      return undefined;
+    }
+
+    // 3. Persistir en Firestore (tolerante a fallos; nunca bloquea la respuesta)
+    try {
+      await docRef.set({
+        encodedPath,
+        stopsHash,
+        generatedAt: Date.now(),
+        geometryVersion: NimbusService.GEOMETRY_VERSION,
+        pointCount: polyline.decode(encodedPath).length,
+      });
+      this.logger.log(`🗺️ route_geometry MISS → guardado ${docId}`);
+    } catch (writeError: any) {
+      this.logger.warn(
+        `⚠️ No se pudo guardar route_geometry/${docId}: ${writeError.message}`,
+      );
+    }
+
+    return encodedPath;
+  }
+
+  /**
    * Data Shaping: Transforma una ruta cruda a formato detallado con coordenadas para Google Maps
    * @param rawRoute - Ruta cruda de la API de Nimbus
    * @param depotId - ID del depot
@@ -1323,10 +1469,14 @@ export class NimbusService {
     // Generar encodedPath profesional con Google Directions API
     let encodedPath: string | undefined;
 
-    // PRIORIDAD 1: Google Directions API (polilínea perfecta siguiendo calles)
+    // PRIORIDAD 1: Geometría de alta resolución (caché Firestore + Directions)
     // Usa las paradas como origin, destination y waypoints
     if (detailedStops.length >= 2) {
-      encodedPath = await this.generateDirectionsEncodedPath(detailedStops);
+      encodedPath = await this.getOrGenerateRouteGeometry(
+        depotId,
+        Number(rawRoute.id),
+        detailedStops,
+      );
     }
 
     // PRIORIDAD 2 (FALLBACK): Unir puntos con líneas rectas
@@ -1620,6 +1770,73 @@ export class NimbusService {
     return encoded;
   }
 
+  private get nimbusBase(): string {
+    return process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api';
+  }
+
+  // Construye un ShapedRoute mínimo a partir de la respuesta cruda de Nimbus
+  // (una ruta recién creada/editada aún no trae paradas formateadas).
+  private toMinimalShapedRoute(raw: any, depotId: number): ShapedRoute {
+    return {
+      id: Number(raw?.id),
+      name: raw?.n || raw?.nm || 'Ruta sin nombre',
+      from: '',
+      to: '',
+      depotId,
+      stops: [],
+      totalStops: 0,
+      unitId: null,
+      unitName: null,
+    };
+  }
+
+  async createRoute(
+    uid: string,
+    depotId: number,
+    dto: CreateRouteDto,
+  ): Promise<ShapedRoute> {
+    const token = await this.getNimbusToken(uid);
+    const res = await firstValueFrom(
+      this.httpService.post(
+        `${this.nimbusBase}/depot/${depotId}/routes`,
+        { n: dto.n, d: dto.d },
+        { headers: { Authorization: `Token ${token}` }, timeout: 15000 },
+      ),
+    );
+    return this.toMinimalShapedRoute(res.data, depotId);
+  }
+
+  async updateRoute(
+    uid: string,
+    routeId: number,
+    dto: UpdateRouteDto,
+  ): Promise<ShapedRoute> {
+    const token = await this.getNimbusToken(uid);
+    const body: Record<string, string> = {};
+    if (dto.n !== undefined) body.n = dto.n;
+    if (dto.d !== undefined) body.d = dto.d;
+    const res = await firstValueFrom(
+      this.httpService.patch(
+        `${this.nimbusBase}/routes/${routeId}`,
+        body,
+        { headers: { Authorization: `Token ${token}` }, timeout: 15000 },
+      ),
+    );
+    const depotId = Number(res.data?.depot_id ?? res.data?.depotId ?? 0);
+    return this.toMinimalShapedRoute({ ...res.data, id: routeId }, depotId);
+  }
+
+  async deleteRoute(uid: string, routeId: number): Promise<{ success: boolean }> {
+    const token = await this.getNimbusToken(uid);
+    await firstValueFrom(
+      this.httpService.delete(`${this.nimbusBase}/routes/${routeId}`, {
+        headers: { Authorization: `Token ${token}` },
+        timeout: 15000,
+      }),
+    );
+    return { success: true };
+  }
+
   /**
    * Obtiene la ubicación en tiempo real de una unidad desde Wialon
    * @param uid - ID del usuario autenticado
@@ -1628,14 +1845,12 @@ export class NimbusService {
    */
   async getUnitLocation(uid: string, unitId: string) {
     try {
-      // Obtener token de Wialon del usuario
-      const userDoc = await this.firebaseService
-        .getFirestore()
-        .collection('users')
-        .doc(uid)
-        .get();
-
-      const wialonToken = userDoc.data()?.wialonToken;
+      // Token Wialon multi-tenant: propio -> proveedor (companies -> adminUid)
+      // -> settings/ttc para super_admin. Así un pasajero hereda el de su proveedor.
+      const wialonToken = await this.firebaseService.resolveProviderToken(
+        uid,
+        'wialon',
+      );
 
       if (!wialonToken) {
         throw new UnauthorizedException(

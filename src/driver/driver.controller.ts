@@ -13,6 +13,7 @@ import { DriverService, ApproachPayload } from './driver.service';
 import { GetAvailableRoutesDto } from './dto/get-available-routes.dto';
 import { StartShiftDto } from './dto/start-shift.dto';
 import { EndShiftDto } from './dto/end-shift.dto';
+import { GetActiveShiftDto } from './dto/get-active-shift.dto';
 import { ApproachQueryDto } from './dto/approach.dto';
 import { UpdateLocationDto } from './dto/update-location.dto';
 import { UpdateProfilePhotoDto } from './dto/update-profile-photo.dto';
@@ -82,6 +83,25 @@ export class DriverController {
         {
           success: false,
           message: error.message || 'Error al finalizar el turno',
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Get('active-shift')
+  async getActiveShift(@Query() query: GetActiveShiftDto) {
+    try {
+      const result = await this.driverService.getActiveShift(query.driverId);
+      return result;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        {
+          success: false,
+          message: error.message || 'Error al buscar turno activo',
         },
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
@@ -207,8 +227,10 @@ export class DriverController {
   @HttpCode(200)
   async scanPassenger(@Body() dto: ScanPassengerDto) {
     try {
+      console.log('📥 POST /api/driver/scan-passenger recibido:', dto);
       return await this.driverService.scanPassenger(dto);
     } catch (error) {
+      console.error('❌ Error en scan-passenger:', error);
       if (error instanceof HttpException) {
         throw error;
       }

@@ -1,6 +1,7 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { NimbusService } from '../nimbus/nimbus.service';
+import { PushService } from '../push/push.service';
 import { GetAvailableRoutesDto } from './dto/get-available-routes.dto';
 import { StartShiftDto } from './dto/start-shift.dto';
 import { ApproachQueryDto } from './dto/approach.dto';
@@ -8,6 +9,7 @@ import { UpdateLocationDto } from './dto/update-location.dto';
 import { firstValueFrom } from 'rxjs';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
+import { FieldValue } from 'firebase-admin/firestore';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
@@ -48,6 +50,7 @@ export class DriverService {
     private readonly httpService: HttpService,
     private readonly nimbusService: NimbusService,
     private readonly configService: ConfigService,
+    private readonly pushService: PushService,
   ) {}
 
   private approachCache = new Map<string, ApproachCacheEntry>();
@@ -162,8 +165,8 @@ export class DriverService {
             const currentUnix = dayjs().unix();
 
             // 3. Ventana de Tiempo Estricta
-            // Regla A: No mostrar si falta MÁS de 1 hora (3600 segundos) para iniciar
-            if (startUnix - currentUnix > 3600) return;
+            // Regla A: No mostrar si falta MÁS de 30 minutos (1800 segundos) para iniciar
+            if (startUnix - currentUnix > 1800) return;
 
             // Regla B: No mostrar si ya pasaron MÁS de 30 minutos (1800 segundos) y nadie inició el viaje
             if (
@@ -198,11 +201,72 @@ export class DriverService {
                 }
               }
 
+              // Extraer el array completo de paradas con sus datos
+              const stops: any[] = [];
+              if (matchedRoute.st && Array.isArray(matchedRoute.st)) {
+                matchedRoute.st.forEach((stopRef: any, index: number) => {
+                  const stopData = stopsMap.get(Number(stopRef.id));
+                  if (stopData) {
+                    stops.push({
+                      id: stopRef.id,
+                      name: stopData.name || `Parada ${index + 1}`,
+                      lat: stopData.lat || 0,
+                      lng: stopData.lng || 0,
+                      order: index,
+                    });
+                  } else {
+                    stops.push({
+                      id: stopRef.id,
+                      name: `Parada ${index + 1}`,
+                      lat: 0,
+                      lng: 0,
+                      order: index,
+                    });
+                  }
+                });
+              }
+
+              // Extraer encodedPath de la ruta (shape, path, o fragmentos en paradas)
+              let encodedPath: string | null = null;
+              if (
+                matchedRoute.shape &&
+                typeof matchedRoute.shape === 'string'
+              ) {
+                encodedPath = matchedRoute.shape;
+              } else if (
+                matchedRoute.path &&
+                typeof matchedRoute.path === 'string'
+              ) {
+                encodedPath = matchedRoute.path;
+              } else if (
+                matchedRoute.geometry &&
+                typeof matchedRoute.geometry === 'string'
+              ) {
+                encodedPath = matchedRoute.geometry;
+              } else if (matchedRoute.st && Array.isArray(matchedRoute.st)) {
+                // Concatenar fragmentos de path de cada parada (st[i].p)
+                const pathFragments: string[] = [];
+                matchedRoute.st.forEach((stopRef: any) => {
+                  if (
+                    stopRef.p &&
+                    typeof stopRef.p === 'string' &&
+                    stopRef.p.length > 0
+                  ) {
+                    pathFragments.push(stopRef.p);
+                  }
+                });
+                if (pathFragments.length > 0) {
+                  encodedPath = pathFragments.join('');
+                }
+              }
+
               resultRoutes.set(routeIdStr, {
                 routeId: matchedRoute.id,
                 routeName: routeName,
                 depotId: depot.id,
                 stopsCount: matchedRoute.st?.length || 0,
+                stops: stops,
+                encodedPath: encodedPath,
                 availableRides: [],
               });
             }
@@ -348,11 +412,40 @@ export class DriverService {
   async startShift(dto: StartShiftDto) {
     try {
       const db = this.firebaseService.getFirestore();
-      const { companyId, unitId, depotId, rideId, routeId } = dto;
+      const {
+        driverId,
+        companyId,
+        unitId,
+        depotId,
+        rideId,
+        routeId,
+        routeName,
+        stops: incomingStops,
+        stopsCount: incomingStopsCount,
+        unitName,
+        capacity,
+        encodedPath: incomingEncodedPath,
+        timeRange,
+        driverName,
+      } = dto;
 
       this.logger.log(
-        `🚀 Iniciando turno - Company: ${companyId}, Unit: ${unitId}, Depot: ${depotId}, Ride: ${rideId}, Route: ${routeId}`,
+        `🚀 Iniciando turno - Driver: ${driverId}, Company: ${companyId}, Unit: ${unitId}, Depot: ${depotId}, Ride: ${rideId}, Route: ${routeId}`,
       );
+
+      // 0. Verificar si el conductor ya tiene un turno activo
+      const existingShift = await db
+        .collection('shifts')
+        .where('driverId', '==', driverId)
+        .where('status', '==', 'ACTIVE')
+        .limit(1)
+        .get();
+
+      if (!existingShift.empty) {
+        throw new BadRequestException(
+          'El conductor ya tiene un turno activo. Finalízalo antes de iniciar uno nuevo.',
+        );
+      }
 
       // 1. Buscar el documento de la empresa en Firestore
       const userDoc = await db.collection('users').doc(companyId).get();
@@ -399,15 +492,45 @@ export class DriverService {
         }
       }
 
-      this.logger.log(
-        `✅ Turno iniciado exitosamente - Unit ${unitId} asignada a Ride ${rideId}`,
-      );
-
       // 4. Hidratar ride con ruta detallada (incluye encodedPath)
       const shapedRoute = await this.shapeRideIntoDetailedRoute(
         companyId,
         Number(routeId),
         Number(depotId),
+      );
+
+      // 5. Crear documento en la colección shifts con datos completos
+      const finalStops = incomingStops || shapedRoute.stops || [];
+      const finalEncodedPath =
+        incomingEncodedPath || shapedRoute.encodedPath || null;
+
+      const shiftData = {
+        driverId,
+        driverName: driverName || null,
+        companyId,
+        unitId,
+        depotId,
+        rideId: String(rideId),
+        routeId,
+        routeName: routeName || shapedRoute.routeName,
+        stops: finalStops,
+        stopsCount: incomingStopsCount ?? finalStops.length,
+        unitName: unitName || null,
+        capacity: capacity || null,
+        encodedPath: finalEncodedPath,
+        timeRange: timeRange || null,
+        currentOccupancy: 0,
+        currentStopIndex: 0,
+        status: 'ACTIVE',
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+      };
+
+      const shiftRef = await db.collection('shifts').add(shiftData);
+      const shiftId = shiftRef.id;
+
+      this.logger.log(
+        `✅ Turno creado en shifts/${shiftId} - Unit ${unitId} asignada a Ride ${rideId}`,
       );
 
       // Log explícito: el encodedPath se pasa al JSON de respuesta
@@ -419,14 +542,25 @@ export class DriverService {
         success: true,
         message: 'Turno iniciado correctamente',
         data: {
+          shiftId,
+          driverId,
+          driverName: shiftData.driverName,
+          companyId,
           unitId,
-          rideId,
           depotId,
+          rideId,
           routeId,
-          routeName: shapedRoute.routeName,
-          stops: shapedRoute.stops,
-          encodedPath: shapedRoute.encodedPath, // 🗺️ Polilínea profesional para el celular
-          assignedAt: new Date().toISOString(),
+          routeName: shiftData.routeName,
+          stops: shiftData.stops,
+          stopsCount: shiftData.stopsCount,
+          unitName: shiftData.unitName,
+          capacity: shiftData.capacity,
+          encodedPath: shiftData.encodedPath,
+          timeRange: shiftData.timeRange,
+          currentOccupancy: shiftData.currentOccupancy,
+          currentStopIndex: shiftData.currentStopIndex,
+          status: shiftData.status,
+          startedAt: shiftData.startedAt,
         },
       };
     } catch (error) {
@@ -443,39 +577,76 @@ export class DriverService {
   async endShift(dto: any) {
     try {
       const db = this.firebaseService.getFirestore();
-      const { companyId, unitId, rideId, depotId } = dto;
+      const { shiftId, driverId, companyId, unitId, rideId, depotId } = dto;
 
       this.logger.log(
-        `🛑 Finalizando turno - Unit: ${unitId}, Ride: ${rideId}, Depot: ${depotId || 'No enviado'}`,
+        `🛑 Finalizando turno - ShiftId: ${shiftId}, Driver: ${driverId || 'N/A'}`,
       );
 
-      // 1. Cerrar el viaje en el historial de Firebase
-      if (rideId) {
-        await db.collection('rides').doc(String(rideId)).set(
+      // 1. Obtener el documento del turno
+      const shiftDoc = await db.collection('shifts').doc(shiftId).get();
+
+      if (!shiftDoc.exists) {
+        throw new BadRequestException(`Turno ${shiftId} no encontrado`);
+      }
+
+      const shiftData = shiftDoc.data();
+
+      // Validación de seguridad: si se envía driverId, debe coincidir
+      if (driverId && shiftData?.driverId !== driverId) {
+        throw new BadRequestException(
+          'El driverId no coincide con el turno especificado',
+        );
+      }
+
+      if (shiftData?.status === 'COMPLETED') {
+        throw new BadRequestException('Este turno ya fue finalizado');
+      }
+
+      // 2. Actualizar el turno en la colección shifts
+      const endedAt = new Date().toISOString();
+      await db.collection('shifts').doc(shiftId).update({
+        status: 'COMPLETED',
+        endedAt,
+      });
+
+      this.logger.log(`✅ Turno ${shiftId} marcado como COMPLETED`);
+
+      // 3. Cerrar el viaje en el historial de Firebase (colección rides - opcional)
+      const actualRideId = rideId || shiftData?.rideId;
+      if (actualRideId) {
+        await db.collection('rides').doc(String(actualRideId)).set(
           {
             status: 'COMPLETED',
-            endTime: new Date().toISOString(),
+            endTime: endedAt,
             progressPercent: 100,
           },
           { merge: true },
         );
       }
 
-      // 2. Desvincular la unidad en Nimbus (Solo si no es un viaje virtual y tenemos el depotId)
+      // 4. Desvincular la unidad en Nimbus (Solo si no es un viaje virtual y tenemos el depotId)
+      const actualDepotId = depotId || shiftData?.depotId;
+      const actualCompanyId = companyId || shiftData?.companyId;
+      const actualUnitId = unitId || shiftData?.unitId;
+
       if (
-        rideId &&
-        !String(rideId).startsWith('VIRTUAL_') &&
-        depotId &&
-        companyId
+        actualRideId &&
+        !String(actualRideId).startsWith('VIRTUAL_') &&
+        actualDepotId &&
+        actualCompanyId
       ) {
         try {
-          const userDoc = await db.collection('users').doc(companyId).get();
+          const userDoc = await db
+            .collection('users')
+            .doc(actualCompanyId)
+            .get();
           const rawToken = userDoc.data()?.nimbusToken;
 
           if (rawToken) {
             const cleanToken = rawToken.replace(/^Token\s+/i, '').trim();
             const headers = { Authorization: `Token ${cleanToken}` };
-            const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/ride/${rideId}/reassign`;
+            const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${actualDepotId}/ride/${actualRideId}/reassign`;
 
             // Desvincular la unidad en Nimbus usando null (requerido por la API)
             await firstValueFrom(
@@ -488,7 +659,6 @@ export class DriverService {
             this.logger.log(`✅ Unidad desvinculada de Nimbus exitosamente.`);
           }
         } catch (nimbusError: any) {
-          // IMPRIMIR EL ERROR REAL DE WIALON
           const wialonError = nimbusError.response?.data || nimbusError.message;
           this.logger.error(
             `🚨 Fallo al desvincular en Nimbus:`,
@@ -497,12 +667,99 @@ export class DriverService {
         }
       }
 
-      return { success: true, message: 'Turno finalizado correctamente' };
+      return {
+        success: true,
+        message: 'Turno finalizado correctamente',
+        data: {
+          shiftId,
+          status: 'COMPLETED',
+          endedAt,
+        },
+      };
     } catch (error: any) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
       this.logger.error(`Error al finalizar turno: ${error.message}`);
       throw new BadRequestException(
         'Error al finalizar el turno en la base de datos',
       );
+    }
+  }
+
+  async getActiveShift(driverId: string) {
+    try {
+      const db = this.firebaseService.getFirestore();
+
+      this.logger.log(`🔍 Buscando turno activo para driver: ${driverId}`);
+
+      const shiftsSnapshot = await db
+        .collection('shifts')
+        .where('driverId', '==', driverId)
+        .where('status', '==', 'ACTIVE')
+        .limit(1)
+        .get();
+
+      if (shiftsSnapshot.empty) {
+        this.logger.log(`ℹ️ No hay turno activo para driver: ${driverId}`);
+        return {
+          success: true,
+          data: null,
+        };
+      }
+
+      const shiftDoc = shiftsSnapshot.docs[0];
+      const shiftData = shiftDoc.data();
+      const shiftId = shiftDoc.id;
+      const rideId = shiftData.rideId;
+
+      this.logger.log(`✅ Turno activo encontrado: ${shiftId}`);
+
+      // Consultar boardings del turno actual (prioridad por shiftId)
+      const boardingsSnapshot = await db
+        .collection('boardings')
+        .where('shiftId', '==', shiftId)
+        .get();
+
+      let boardedPassengers = boardingsSnapshot.docs.map((doc) => ({
+        boardingId: doc.id,
+        ...doc.data(),
+      }));
+
+      // Fallback: si no hay boardings por shiftId, buscar por rideId
+      if (boardedPassengers.length === 0 && rideId) {
+        this.logger.log(`🔄 Fallback: buscando boardings por rideId ${rideId}`);
+        const rideBoardingsSnapshot = await db
+          .collection('boardings')
+          .where('rideId', '==', rideId)
+          .get();
+
+        boardedPassengers = rideBoardingsSnapshot.docs.map((doc) => ({
+          boardingId: doc.id,
+          ...doc.data(),
+        }));
+      }
+
+      this.logger.log(
+        `👥 ${boardedPassengers.length} pasajeros abordados en turno ${shiftId}`,
+      );
+
+      return {
+        success: true,
+        data: {
+          shiftId: shiftDoc.id,
+          ...shiftData,
+          // Garantizar que el índice de parada siempre llegue al frontend
+          // (turnos creados antes de esta función no tienen el campo).
+          currentStopIndex: shiftData.currentStopIndex ?? 0,
+          boardedPassengers: boardedPassengers,
+        },
+      };
+    } catch (error: any) {
+      this.logger.error(
+        `Error buscando turno activo para ${driverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Error al buscar turno activo');
     }
   }
 
@@ -721,11 +978,12 @@ export class DriverService {
           throw new BadRequestException(`Unidad ${unitId} no encontrada`);
         }
 
-        // Extraer posición y rumbo
+        // Extraer posición, rumbo y nombre de la unidad
         const position = unitData.pos || {};
         const lat = position.y || 0;
         const lng = position.x || 0;
         const course = position.c || 0;
+        const unitName = unitData.nm || null;
 
         if (lat === 0 && lng === 0) {
           throw new BadRequestException(
@@ -738,6 +996,7 @@ export class DriverService {
           lat,
           lng,
           course,
+          unitName,
         };
       } finally {
         // Logout de Wialon para liberar sesión
@@ -771,15 +1030,21 @@ export class DriverService {
     const {
       unitId,
       rideId,
+      shiftId,
       latitude,
       longitude,
       course,
       speed,
       accuracy,
       stopIndex,
+      currentStopIndex,
       routeId,
       companyId,
     } = payload;
+
+    // El índice de parada puede venir como `currentStopIndex` (nombre explícito)
+    // o como `stopIndex` (compatibilidad con la app actual).
+    const resolvedStopIndex = currentStopIndex ?? stopIndex;
 
     try {
       const db = this.firebaseService.getFirestore();
@@ -800,12 +1065,29 @@ export class DriverService {
         lastLocationUpdate: now,
       };
 
-      if (stopIndex !== undefined) {
-        updateData.currentStopIndex = stopIndex;
+      if (resolvedStopIndex !== undefined) {
+        updateData.currentStopIndex = resolvedStopIndex;
       }
 
       if (routeId !== undefined) {
         updateData.routeId = routeId;
+      }
+
+      // Persistir la parada actual en el documento del turno (shifts) para que
+      // el progreso sobreviva aunque la app del chofer se cierre.
+      if (shiftId && resolvedStopIndex !== undefined) {
+        await db
+          .collection('shifts')
+          .doc(shiftId)
+          .update({
+            currentStopIndex: resolvedStopIndex,
+            lastLocationUpdate: now,
+          })
+          .catch((err) => {
+            this.logger.warn(
+              `⚠️ No se pudo actualizar currentStopIndex en shift ${shiftId}: ${err.message}`,
+            );
+          });
       }
 
       // Actualizar documento de ride activo si existe rideId
@@ -814,6 +1096,16 @@ export class DriverService {
           .collection('rides')
           .doc(String(rideId))
           .set(updateData, { merge: true });
+      }
+
+      // Push de LLEGADA: si el ride alcanzó la última parada, notificar una sola
+      // vez a todos los pasajeros abordados (flag arrivalNotified en el ride).
+      if (rideId !== undefined && resolvedStopIndex !== undefined) {
+        void this.notifyArrivalIfFinalStop(
+          String(rideId),
+          shiftId,
+          resolvedStopIndex,
+        );
       }
 
       // También guardar en un documento de tracking por unidad para historial
@@ -839,7 +1131,7 @@ export class DriverService {
         rideId !== undefined &&
         companyId &&
         routeId !== undefined &&
-        stopIndex !== undefined
+        resolvedStopIndex !== undefined
       ) {
         try {
           const approach = await this.getApproach(String(rideId), {
@@ -847,7 +1139,7 @@ export class DriverService {
             unitId,
             depotId: payload.depotId || 0,
             routeId,
-            stopIndex,
+            stopIndex: resolvedStopIndex,
             lat: latitude,
             lng: longitude,
           });
@@ -882,6 +1174,65 @@ export class DriverService {
         `Error actualizando ubicación unit=${unitId}: ${error.message}`,
       );
       throw new BadRequestException('Error al guardar ubicación');
+    }
+  }
+
+  /**
+   * Si el ride alcanzó su última parada y aún no se ha notificado, envía un push
+   * de "llegada a destino" a todos los pasajeros con boarding en ese ride y marca
+   * arrivalNotified=true en el ride para no repetir. Tolerante a fallos.
+   */
+  private async notifyArrivalIfFinalStop(
+    rideId: string,
+    shiftId: string | undefined,
+    stopIndex: number,
+  ): Promise<void> {
+    try {
+      const db = this.firebaseService.getFirestore();
+
+      // Total de paradas: del shift (stopsCount o stops.length). Sin dato → salir.
+      let totalStops = 0;
+      if (shiftId) {
+        const shiftSnap = await db.collection('shifts').doc(shiftId).get();
+        const sd = shiftSnap.data();
+        totalStops =
+          (typeof sd?.stopsCount === 'number' ? sd.stopsCount : 0) ||
+          (Array.isArray(sd?.stops) ? sd!.stops.length : 0);
+      }
+      if (!totalStops || stopIndex < totalStops - 1) return;
+
+      // Anti-repetición: si el ride ya fue notificado, no hacer nada.
+      const rideSnap = await db.collection('rides').doc(rideId).get();
+      if (rideSnap.data()?.arrivalNotified === true) return;
+
+      // Pasajeros abordados en este ride.
+      const boardingsSnap = await db
+        .collection('boardings')
+        .where('rideId', '==', rideId)
+        .get();
+      const uids = [
+        ...new Set(
+          boardingsSnap.docs
+            .map((d) => d.data()?.passengerId as string | undefined)
+            .filter((v): v is string => !!v),
+        ),
+      ];
+
+      // Marcar primero (evita carrera si entran dos updates casi simultáneos).
+      await db
+        .collection('rides')
+        .doc(rideId)
+        .set({ arrivalNotified: true }, { merge: true });
+
+      if (uids.length > 0) {
+        await this.pushService.sendToUsers(uids, {
+          title: 'Llegaste a tu destino',
+          body: 'El viaje ha finalizado en la última parada.',
+          data: { type: 'arrival', rideId },
+        });
+      }
+    } catch (err) {
+      this.logger.warn(`[push] notifyArrival falló para ride ${rideId}: ${err}`);
     }
   }
 
@@ -1045,18 +1396,40 @@ export class DriverService {
   }
 
   /**
-   * Escanea el QR de un pasajero y retorna sus datos
+   * Escanea el QR de un pasajero, guarda el abordaje en boardings y retorna sus datos
    */
   async scanPassenger(dto: {
     companyId: string;
     passengerId: string;
     qr: string;
     rideId: string;
+    shiftId?: string;
+    passengerName?: string;
     scannedAt?: string;
     stopIndex?: number;
+    stopName?: string;
     unitId: string;
+    lat?: number;
+    lng?: number;
+    latitude?: number;
+    longitude?: number;
   }) {
-    const { qr, passengerId } = dto;
+    const {
+      qr,
+      passengerId,
+      companyId,
+      rideId,
+      shiftId,
+      unitId,
+      lat,
+      lng,
+      latitude,
+      longitude,
+    } = dto;
+
+    // Normalizar coordenadas: usar lat/lng o latitude/longitude
+    const finalLat = lat ?? latitude ?? null;
+    const finalLng = lng ?? longitude ?? null;
 
     try {
       const db = this.firebaseService.getFirestore();
@@ -1081,6 +1454,7 @@ export class DriverService {
 
       // Cascada de validación para soportar app legacy (user_tokens) y app nueva
       const passengerName =
+        dto.passengerName ||
         userData?.userName ||
         userData?.name ||
         userData?.displayName ||
@@ -1092,6 +1466,52 @@ export class DriverService {
       this.logger.log(
         `👤 Pasajero identificado: ${passengerName} (ID: ${passengerIdResolved})`,
       );
+
+      // Guardar el abordaje en la colección boardings
+      const boardingData = {
+        shiftId: shiftId || null,
+        rideId: rideId,
+        passengerId: passengerIdResolved,
+        passengerName: passengerName,
+        qrCode: qr,
+        unitId: unitId,
+        companyId: companyId,
+        lat: finalLat,
+        lng: finalLng,
+        stopIndex: typeof dto.stopIndex === 'number' ? dto.stopIndex : null,
+        stopName: dto.stopName ?? null,
+        scannedAt: dto.scannedAt || new Date().toISOString(),
+        source: 'app_chofer',
+      };
+
+      this.logger.log(
+        `💾 Guardando abordaje en boardings: ${JSON.stringify(boardingData)}`,
+      );
+
+      await db.collection('boardings').add(boardingData);
+
+      this.logger.log(
+        `✅ Abordaje guardado en boardings: ${passengerName} en ride ${rideId}`,
+      );
+
+      // Push de abordaje al pasajero escaneado (no rompe el flujo si falla).
+      void this.pushService.sendToUsers([passengerIdResolved], {
+        title: 'Abordaje confirmado',
+        body: `Has subido a la unidad ${unitId}.`,
+        data: { type: 'boarding', rideId },
+      });
+
+      // Incrementar currentOccupancy en el turno si shiftId está presente
+      if (shiftId) {
+        await db
+          .collection('shifts')
+          .doc(shiftId)
+          .update({
+            currentOccupancy: FieldValue.increment(1),
+          });
+
+        this.logger.log(`📊 currentOccupancy incrementado en turno ${shiftId}`);
+      }
 
       return {
         success: true,

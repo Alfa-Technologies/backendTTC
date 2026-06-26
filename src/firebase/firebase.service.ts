@@ -89,4 +89,57 @@ export class FirebaseService implements OnModuleInit {
   getAuth() {
     return this.app.auth();
   }
+
+  /**
+   * Resuelve el token Wialon/Nimbus a usar para un usuario (multi-tenant).
+   * Cadena:
+   *   1. users/{uid} tiene token propio          -> úsalo
+   *   2. users/{uid}.companyId                    -> companies/{companyId}.adminUid
+   *                                                 -> users/{adminUid}.<token>
+   *   3. users/{uid}.role == super_admin (sin     -> settings/ttc.<token> (maestro)
+   *      companyId)
+   * Devuelve null si no se encuentra ninguno.
+   * Nimbus normaliza el prefijo "Token ".
+   */
+  async resolveProviderToken(
+    uid: string,
+    provider: 'wialon' | 'nimbus',
+  ): Promise<string | null> {
+    const field = provider === 'wialon' ? 'wialonToken' : 'nimbusToken';
+    const norm = (v: unknown): string | null => {
+      if (typeof v !== 'string' || !v.trim()) return null;
+      return provider === 'nimbus' ? v.replace(/^Token\s+/i, '').trim() : v.trim();
+    };
+
+    const userSnap = await this.db.collection('users').doc(uid).get();
+    const userData = userSnap.data() ?? {};
+
+    // 1. Token propio.
+    const own = norm(userData[field]);
+    if (own) return own;
+
+    // 2. Token del proveedor vía companies -> adminUid.
+    const companyId = userData.companyId as string | undefined;
+    if (companyId) {
+      const companySnap = await this.db
+        .collection('companies')
+        .doc(companyId)
+        .get();
+      // companies/{id} === adminUid por invariante; si falta adminUid, usa companyId.
+      const adminUid =
+        (companySnap.data()?.adminUid as string | undefined) || companyId;
+      const adminSnap = await this.db.collection('users').doc(adminUid).get();
+      const inherited = norm(adminSnap.data()?.[field]);
+      if (inherited) return inherited;
+    }
+
+    // 3. TTC maestro (super_admin sin companyId).
+    if (userData.role === 'super_admin') {
+      const ttcSnap = await this.db.collection('settings').doc('ttc').get();
+      const master = norm(ttcSnap.data()?.[field]);
+      if (master) return master;
+    }
+
+    return null;
+  }
 }
