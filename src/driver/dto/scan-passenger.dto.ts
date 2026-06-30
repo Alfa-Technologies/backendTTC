@@ -44,6 +44,10 @@ export class ScanPassengerDto {
   @IsString()
   stopName?: string;
 
+  @IsOptional()
+  @IsString()
+  routeName?: string;
+
   @IsString()
   @IsNotEmpty({ message: 'El unitId es requerido' })
   unitId: string;

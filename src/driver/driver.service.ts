@@ -1227,7 +1227,7 @@ export class DriverService {
       if (uids.length > 0) {
         await this.pushService.sendToUsers(uids, {
           title: 'Llegaste a tu destino',
-          body: 'El viaje ha finalizado en la última parada.',
+          body: 'Tu viaje ha finalizado. ¡Gracias por viajar con nosotros!',
           data: { type: 'arrival', rideId },
         });
       }
@@ -1408,6 +1408,7 @@ export class DriverService {
     scannedAt?: string;
     stopIndex?: number;
     stopName?: string;
+    routeName?: string;
     unitId: string;
     lat?: number;
     lng?: number;
@@ -1421,6 +1422,7 @@ export class DriverService {
       rideId,
       shiftId,
       unitId,
+      routeName,
       lat,
       lng,
       latitude,
@@ -1495,10 +1497,15 @@ export class DriverService {
       );
 
       // Push de abordaje al pasajero escaneado (no rompe el flujo si falla).
+      // El routeName viene en el payload del conductor (ya lo tiene en memoria),
+      // así no hacemos consultas extra a Firestore aquí.
+      const boardingBody = routeName
+        ? `Vas a bordo de la ruta ${routeName}. ¡Buen viaje!`
+        : 'Tu viaje ha comenzado. ¡Buen viaje!';
       void this.pushService.sendToUsers([passengerIdResolved], {
         title: 'Abordaje confirmado',
-        body: `Has subido a la unidad ${unitId}.`,
-        data: { type: 'boarding', rideId },
+        body: boardingBody,
+        data: { type: 'boarding', rideId, routeName: routeName ?? null },
       });
 
       // Incrementar currentOccupancy en el turno si shiftId está presente
