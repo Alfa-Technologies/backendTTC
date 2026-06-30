@@ -1422,7 +1422,6 @@ export class DriverService {
       rideId,
       shiftId,
       unitId,
-      routeName,
       lat,
       lng,
       latitude,
@@ -1497,15 +1496,11 @@ export class DriverService {
       );
 
       // Push de abordaje al pasajero escaneado (no rompe el flujo si falla).
-      // El routeName viene en el payload del conductor (ya lo tiene en memoria),
-      // así no hacemos consultas extra a Firestore aquí.
-      const boardingBody = routeName
-        ? `Vas a bordo de la ruta ${routeName}. ¡Buen viaje!`
-        : 'Tu viaje ha comenzado. ¡Buen viaje!';
+      // Texto genérico amable, sin IDs técnicos ni consultas extra a Firestore.
       void this.pushService.sendToUsers([passengerIdResolved], {
         title: 'Abordaje confirmado',
-        body: boardingBody,
-        data: { type: 'boarding', rideId, routeName: routeName ?? null },
+        body: 'Tu viaje ha comenzado. ¡Buen viaje!',
+        data: { type: 'boarding', rideId },
       });
 
       // Incrementar currentOccupancy en el turno si shiftId está presente
