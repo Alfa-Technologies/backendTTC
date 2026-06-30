@@ -1108,6 +1108,15 @@ export class DriverService {
         );
       }
 
+      // Push de PROXIMIDAD: evalúa por evento a los pasajeros que esperan esta
+      // ruta (por routeId, no depende del índice de parada). Dos fases: 2000m/500m.
+      void this.notifyApproachingPassengers(
+        routeId,
+        rideId,
+        latitude,
+        longitude,
+      );
+
       // También guardar en un documento de tracking por unidad para historial
       await db
         .collection('tracking')
@@ -1233,6 +1242,101 @@ export class DriverService {
       }
     } catch (err) {
       this.logger.warn(`[push] notifyArrival falló para ride ${rideId}: ${err}`);
+    }
+  }
+
+  /** Distancia en metros entre dos coordenadas (Haversine). */
+  private metersBetween(
+    lat1: number,
+    lng1: number,
+    lat2: number,
+    lng2: number,
+  ): number {
+    const R = 6371000; // metros
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) *
+        Math.cos(toRad(lat2)) *
+        Math.sin(dLng / 2) *
+        Math.sin(dLng / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  /**
+   * Evalúa por evento (cada GPS update del chofer) qué pasajeros que ESPERAN esta
+   * ruta están dentro de los umbrales y les envía el push correspondiente, una
+   * sola vez por fase (banderas en waiting_passengers). Query por routeId porque
+   * el pasajero pudo fijar la ruta sin unidad asignada. Nunca lanza.
+   */
+  private async notifyApproachingPassengers(
+    routeId: number | string | undefined,
+    rideId: number | string | undefined,
+    latitude: number,
+    longitude: number,
+  ): Promise<void> {
+    if (routeId === undefined || routeId === null) return;
+    try {
+      const db = this.firebaseService.getFirestore();
+      const snap = await db
+        .collection('waiting_passengers')
+        .where('routeId', '==', String(routeId))
+        .get();
+      if (snap.empty) return;
+
+      for (const docSnap of snap.docs) {
+        const w = docSnap.data() as {
+          passengerId?: string;
+          stopLat?: number;
+          stopLng?: number;
+          notified_2000m?: boolean;
+          notified_500m?: boolean;
+        };
+        const pid = w.passengerId;
+        if (
+          !pid ||
+          typeof w.stopLat !== 'number' ||
+          typeof w.stopLng !== 'number'
+        ) {
+          continue;
+        }
+
+        const dist = this.metersBetween(
+          latitude,
+          longitude,
+          w.stopLat,
+          w.stopLng,
+        );
+
+        if (dist <= 500) {
+          // Fase 2 tiene prioridad. Enviar solo si no se ha enviado.
+          if (!w.notified_500m) {
+            void this.pushService.sendToUsers([pid], {
+              title: 'Tu unidad está por llegar',
+              body: 'Tu unidad está por llegar a tu parada.',
+              data: { type: 'approaching_near', rideId: rideId ?? null },
+            });
+          }
+          // Marca AMBAS banderas: aunque no se mandó la Fase 1, se da por
+          // consumida para que nunca llegue después de forma incoherente.
+          await docSnap.ref.update({
+            notified_2000m: true,
+            notified_500m: true,
+          });
+        } else if (dist <= 2000 && !w.notified_2000m) {
+          void this.pushService.sendToUsers([pid], {
+            title: 'Tu unidad está en camino',
+            body: 'Tu unidad está en camino, prepárate.',
+            data: { type: 'approaching_far', rideId: rideId ?? null },
+          });
+          await docSnap.ref.update({ notified_2000m: true });
+        }
+        // else: fuera de rango o ya notificado → nada.
+      }
+    } catch (err) {
+      this.logger.warn(`[push] notifyApproachingPassengers falló: ${err}`);
     }
   }
 
