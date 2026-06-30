@@ -78,8 +78,60 @@ export class PushService {
           this.logger.warn(`[push] error enviando chunk: ${err}`);
         }
       }
+
+      // Persistir en el buzón de notificaciones (independiente del envío de push).
+      await this.persistNotifications(uids, payload);
     } catch (err) {
       this.logger.warn(`[push] sendToUsers falló: ${err}`);
+    }
+  }
+
+  /** Parte un arreglo en bloques de `size` (límite de writeBatch en Firestore: 500). */
+  private chunkArray<T>(arr: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) {
+      out.push(arr.slice(i, i + size));
+    }
+    return out;
+  }
+
+  /**
+   * Persiste una notificación por cada uid destinatario en la colección
+   * `notifications`. Escribe para TODOS los uids (no solo los que tenían token),
+   * para que el buzón de la app refleje el aviso aunque el push no se entregara.
+   * Parte en bloques de 500 (límite de writeBatch). Nunca lanza.
+   */
+  private async persistNotifications(
+    uids: string[],
+    payload: PushPayload,
+  ): Promise<void> {
+    try {
+      const db = this.firebaseService.getFirestore();
+      const uniqueUids = [...new Set(uids.filter(Boolean))];
+      if (uniqueUids.length === 0) return;
+
+      const type =
+        typeof payload.data?.type === 'string' ? payload.data.type : 'system';
+      const createdAt = new Date().toISOString();
+
+      for (const block of this.chunkArray(uniqueUids, 500)) {
+        const batch = db.batch();
+        for (const uid of block) {
+          const ref = db.collection('notifications').doc();
+          batch.set(ref, {
+            userId: uid,
+            type,
+            title: payload.title,
+            body: payload.body,
+            read: false,
+            createdAt,
+            data: payload.data ?? {},
+          });
+        }
+        await batch.commit();
+      }
+    } catch (err) {
+      this.logger.warn(`[push] persistNotifications falló: ${err}`);
     }
   }
 
