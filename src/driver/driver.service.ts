@@ -1,18 +1,23 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  InternalServerErrorException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import dayjs from 'dayjs';
+import timezone from 'dayjs/plugin/timezone';
+import utc from 'dayjs/plugin/utc';
+import { FieldValue } from 'firebase-admin/firestore';
+import { firstValueFrom } from 'rxjs';
 import { FirebaseService } from '../firebase/firebase.service';
 import { NimbusService } from '../nimbus/nimbus.service';
 import { PushService } from '../push/push.service';
+import { ApproachQueryDto } from './dto/approach.dto';
 import { GetAvailableRoutesDto } from './dto/get-available-routes.dto';
 import { StartShiftDto } from './dto/start-shift.dto';
-import { ApproachQueryDto } from './dto/approach.dto';
 import { UpdateLocationDto } from './dto/update-location.dto';
-import { firstValueFrom } from 'rxjs';
-import { HttpService } from '@nestjs/axios';
-import { ConfigService } from '@nestjs/config';
-import { FieldValue } from 'firebase-admin/firestore';
-import dayjs from 'dayjs';
-import utc from 'dayjs/plugin/utc';
-import timezone from 'dayjs/plugin/timezone';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -58,15 +63,17 @@ export class DriverService {
   private apiCache = new Map<string, { data: any; expiresAt: number }>();
 
   async getAvailableRoutes(dto: GetAvailableRoutesDto) {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     try {
       const db = this.firebaseService.getFirestore();
       const { companyId, unitId, date, forceRefresh } = dto;
 
-      // Si el frontend exige actualización forzada (ej. al escanear QR), limpiamos la caché global
+      // Force refresh (ej. al escanear QR) limpia la caché global de la empresa
       if (forceRefresh) {
-        this.logger.log(
-          `🧹 Force Refresh detectado: Limpiando caché para la empresa ${companyId}`,
-        );
         this.apiCache.clear();
       }
 
@@ -85,10 +92,10 @@ export class DriverService {
 
       // 1. Obtener Depots
       const depotsRes = await firstValueFrom(
-        this.httpService.get(
-          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
-          { headers, timeout: 30000 },
-        ),
+        this.httpService.get(`${nimbusApiUrl}/depots`, {
+          headers,
+          timeout: 30000,
+        }),
       );
       const depots = depotsRes.data.depots || [];
       const resultRoutes = new Map<string, any>();
@@ -104,24 +111,21 @@ export class DriverService {
 
           // 3. Llamadas SECUENCIALES (Wialon bloquea Promise.all con ECONNRESET)
           const routesRes = await firstValueFrom(
-            this.httpService.get(
-              `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/routes`,
-              { headers, timeout: 30000 },
-            ),
+            this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/routes`, {
+              headers,
+              timeout: 30000,
+            }),
           );
           const ridesRes = await firstValueFrom(
-            this.httpService.get(
-              `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
-              { headers, params: { d: dateString }, timeout: 30000 },
-            ),
+            this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/rides`, {
+              headers,
+              params: { d: dateString },
+              timeout: 30000,
+            }),
           );
 
           const routes = routesRes.data.routes || [];
           const plannedRides = ridesRes.data.rides || [];
-
-          this.logger.log(
-            `📦 Depot ${depot.id}: ${plannedRides.length} rides encontrados para fecha ${dateString}`,
-          );
 
           plannedRides.forEach((ride: any) => {
             // Encontrar a qué ruta pertenece este ride usando el timetable id (tid)
@@ -132,12 +136,7 @@ export class DriverService {
                 break;
               }
             }
-            if (!matchedRoute) {
-              this.logger.warn(
-                `❌ Ride ${ride.id} (tid: ${ride.tid}) sin ruta asociada - FILTRADO`,
-              );
-              return;
-            }
+            if (!matchedRoute) return;
 
             // 1. Filtro de exclusividad: Si el viaje ya tiene otra unidad asignada, lo ocultamos.
             // En Wialon, 'ride.u' trae el ID de la unidad. Si es mayor a 0 y no es nuestra unidad, alguien más lo tomó.
@@ -175,10 +174,6 @@ export class DriverService {
               ride.status !== 'IN_PROGRESS'
             )
               return;
-
-            this.logger.log(
-              `✅ Ride ${ride.id} APROBADO para ruta ${matchedRoute.id}`,
-            );
 
             const routeIdStr = String(matchedRoute.id);
 
@@ -284,7 +279,6 @@ export class DriverService {
       }
 
       const result = Array.from(resultRoutes.values());
-      this.logger.log(`✅ AGENDA ESTABLE CARGADA: ${result.length} rutas.`);
       return result;
     } catch (error: any) {
       this.logger.error('Fallo crítico en getAvailableRoutes', error.stack);
@@ -305,6 +299,11 @@ export class DriverService {
     stops: Array<{ id: number; name: string; lat: number; lng: number }>;
     encodedPath: string | undefined;
   }> {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     let routeName = '';
     let routeStops: Array<{
       id: number;
@@ -328,16 +327,11 @@ export class DriverService {
         routeName = route.name;
         routeStops = route.stops || [];
 
-        this.logger.log(
-          `📐 shapeRideIntoDetailedRoute: ruta ${routeId} hidratada vía getRouteById - ` +
-            `stops=${routeStops.length}, encodedPath=${encodedPath ? 'SÍ (' + encodedPath.length + ' chars)' : 'NO'}`,
-        );
-
         return { routeName, stops: routeStops, encodedPath };
       }
     } catch (primaryError) {
       this.logger.warn(
-        `📐 shapeRideIntoDetailedRoute: getRouteById falló para ${routeId}, intentando fallback manual`,
+        `shapeRideIntoDetailedRoute: getRouteById falló para ${routeId}, usando fallback manual`,
       );
     }
 
@@ -348,14 +342,12 @@ export class DriverService {
       const rawToken = userDoc.data()?.nimbusToken;
 
       if (!rawToken) {
-        this.logger.warn(`📐 Fallback: empresa ${companyId} sin token Nimbus`);
         return { routeName: '', stops: [], encodedPath: undefined };
       }
 
       const cleanToken = rawToken.replace(/^Token\s+/i, '').trim();
       const headers = { Authorization: `Token ${cleanToken}` };
-      const baseUrl =
-        process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api';
+      const baseUrl = nimbusApiUrl;
 
       const routesResponse = await firstValueFrom(
         this.httpService.get(`${baseUrl}/depot/${depotId}/routes`, {
@@ -394,15 +386,11 @@ export class DriverService {
             .filter((stop: any) => stop !== null);
         }
 
-        this.logger.log(
-          `📐 shapeRideIntoDetailedRoute: ruta ${routeId} hidratada vía fallback manual - stops=${routeStops.length}`,
-        );
-
         return { routeName, stops: routeStops, encodedPath: undefined };
       }
     } catch (fallbackError) {
       this.logger.error(
-        `📐 shapeRideIntoDetailedRoute: fallback manual también falló: ${fallbackError.message}`,
+        `shapeRideIntoDetailedRoute: fallback manual también falló para ruta ${routeId}: ${fallbackError.message}`,
       );
     }
 
@@ -410,6 +398,11 @@ export class DriverService {
   }
 
   async startShift(dto: StartShiftDto) {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     try {
       const db = this.firebaseService.getFirestore();
       const {
@@ -430,7 +423,7 @@ export class DriverService {
       } = dto;
 
       this.logger.log(
-        `🚀 Iniciando turno - Driver: ${driverId}, Company: ${companyId}, Unit: ${unitId}, Depot: ${depotId}, Ride: ${rideId}, Route: ${routeId}`,
+        `🔍 DEBUG driverName recibido en DTO: "${driverName}" (typeof ${typeof driverName}) | dto keys: ${Object.keys(dto).join(', ')}`,
       );
 
       // 0. Verificar si el conductor ya tiene un turno activo
@@ -464,15 +457,9 @@ export class DriverService {
       // 3. Hacer petición POST a Nimbus (SOLO si no es un viaje virtual)
       const isVirtualRide = String(rideId).startsWith('VIRTUAL_');
 
-      if (isVirtualRide) {
-        this.logger.log(
-          `⚠️ El viaje ${rideId} es futuro. Se omite /reassign en Nimbus. Se asignará automáticamente en la primera parada.`,
-        );
-      } else {
+      if (!isVirtualRide) {
         const headers = { Authorization: `Token ${cleanToken}` };
-        const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/ride/${rideId}/reassign`;
-
-        this.logger.log(`📡 Enviando petición a Nimbus: ${nimbusUrl}`);
+        const nimbusUrl = `${nimbusApiUrl}/depot/${depotId}/ride/${rideId}/reassign`;
 
         const response = await firstValueFrom(
           this.httpService.post(
@@ -484,7 +471,7 @@ export class DriverService {
 
         if (response.data?.error) {
           this.logger.error(
-            `❌ Error de Nimbus: ${JSON.stringify(response.data.error)}`,
+            `Error de Nimbus: ${JSON.stringify(response.data.error)}`,
           );
           throw new BadRequestException(
             `Error al asignar unidad en Nimbus: ${response.data.error}`,
@@ -529,14 +516,12 @@ export class DriverService {
       const shiftRef = await db.collection('shifts').add(shiftData);
       const shiftId = shiftRef.id;
 
-      this.logger.log(
-        `✅ Turno creado en shifts/${shiftId} - Unit ${unitId} asignada a Ride ${rideId}`,
-      );
-
-      // Log explícito: el encodedPath se pasa al JSON de respuesta
-      this.logger.log(
-        `📤 startShift response: pasando encodedPath=${shapedRoute.encodedPath ? 'SÍ (' + shapedRoute.encodedPath.length + ' chars)' : 'NO'} al JSON de confirmación`,
-      );
+      // Push de inicio de turno al propio conductor (no rompe el flujo si falla)
+      void this.pushService.sendToUsers([driverId], {
+        title: 'Turno iniciado',
+        body: `Tu turno en la ruta ${shiftData.routeName || routeId} ha comenzado. ¡Buen viaje!`,
+        data: { type: 'shift_started', shiftId, routeId },
+      });
 
       return {
         success: true,
@@ -575,13 +560,14 @@ export class DriverService {
   }
 
   async endShift(dto: any) {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     try {
       const db = this.firebaseService.getFirestore();
       const { shiftId, driverId, companyId, unitId, rideId, depotId } = dto;
-
-      this.logger.log(
-        `🛑 Finalizando turno - ShiftId: ${shiftId}, Driver: ${driverId || 'N/A'}`,
-      );
 
       // 1. Obtener el documento del turno
       const shiftDoc = await db.collection('shifts').doc(shiftId).get();
@@ -609,8 +595,6 @@ export class DriverService {
         status: 'COMPLETED',
         endedAt,
       });
-
-      this.logger.log(`✅ Turno ${shiftId} marcado como COMPLETED`);
 
       // 3. Cerrar el viaje en el historial de Firebase (colección rides - opcional)
       const actualRideId = rideId || shiftData?.rideId;
@@ -646,7 +630,7 @@ export class DriverService {
           if (rawToken) {
             const cleanToken = rawToken.replace(/^Token\s+/i, '').trim();
             const headers = { Authorization: `Token ${cleanToken}` };
-            const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${actualDepotId}/ride/${actualRideId}/reassign`;
+            const nimbusUrl = `${nimbusApiUrl}/depot/${actualDepotId}/ride/${actualRideId}/reassign`;
 
             // Desvincular la unidad en Nimbus usando null (requerido por la API)
             await firstValueFrom(
@@ -656,13 +640,11 @@ export class DriverService {
                 { headers, timeout: 15000 },
               ),
             );
-            this.logger.log(`✅ Unidad desvinculada de Nimbus exitosamente.`);
           }
         } catch (nimbusError: any) {
           const wialonError = nimbusError.response?.data || nimbusError.message;
           this.logger.error(
-            `🚨 Fallo al desvincular en Nimbus:`,
-            JSON.stringify(wialonError),
+            `Fallo al desvincular unidad en Nimbus: ${JSON.stringify(wialonError)}`,
           );
         }
       }
@@ -691,8 +673,6 @@ export class DriverService {
     try {
       const db = this.firebaseService.getFirestore();
 
-      this.logger.log(`🔍 Buscando turno activo para driver: ${driverId}`);
-
       const shiftsSnapshot = await db
         .collection('shifts')
         .where('driverId', '==', driverId)
@@ -701,7 +681,6 @@ export class DriverService {
         .get();
 
       if (shiftsSnapshot.empty) {
-        this.logger.log(`ℹ️ No hay turno activo para driver: ${driverId}`);
         return {
           success: true,
           data: null,
@@ -712,8 +691,6 @@ export class DriverService {
       const shiftData = shiftDoc.data();
       const shiftId = shiftDoc.id;
       const rideId = shiftData.rideId;
-
-      this.logger.log(`✅ Turno activo encontrado: ${shiftId}`);
 
       // Consultar boardings del turno actual (prioridad por shiftId)
       const boardingsSnapshot = await db
@@ -728,7 +705,6 @@ export class DriverService {
 
       // Fallback: si no hay boardings por shiftId, buscar por rideId
       if (boardedPassengers.length === 0 && rideId) {
-        this.logger.log(`🔄 Fallback: buscando boardings por rideId ${rideId}`);
         const rideBoardingsSnapshot = await db
           .collection('boardings')
           .where('rideId', '==', rideId)
@@ -739,10 +715,6 @@ export class DriverService {
           ...doc.data(),
         }));
       }
-
-      this.logger.log(
-        `👥 ${boardedPassengers.length} pasajeros abordados en turno ${shiftId}`,
-      );
 
       return {
         success: true,
@@ -767,6 +739,11 @@ export class DriverService {
     rideId: string,
     query: ApproachQueryDto,
   ): Promise<ApproachPayload> {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const { companyId, unitId, depotId, routeId, stopIndex, lat, lng } = query;
 
     try {
@@ -792,8 +769,7 @@ export class DriverService {
         return { ...EMPTY_APPROACH };
       }
       const nimbusToken = rawToken.replace(/^Token\s+/i, '').trim();
-      const nimbusBase =
-        process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api';
+      const nimbusBase = nimbusApiUrl;
       const headers = { Authorization: `Token ${nimbusToken}` };
 
       try {
@@ -891,10 +867,6 @@ export class DriverService {
         payload,
       });
 
-      this.logger.log(
-        `getApproach OK unit=${unitId} stop=${stopIndex} eta=${payload.eta}s dist=${payload.distanceMeters}m`,
-      );
-
       return payload;
     } catch (error) {
       this.logger.error(
@@ -911,6 +883,11 @@ export class DriverService {
    * @returns Objeto con {success, lat, lng, course}
    */
   async getUnitLocation(unitId: string) {
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
+
     try {
       // Obtener token de Wialon desde el primer admin disponible
       const db = this.firebaseService.getFirestore();
@@ -932,17 +909,13 @@ export class DriverService {
 
       // Login en Wialon
       const loginResponse = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'token/login',
-              params: JSON.stringify({ token: wialonToken }),
-            },
-            timeout: 10000,
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'token/login',
+            params: JSON.stringify({ token: wialonToken }),
           },
-        ),
+          timeout: 10000,
+        }),
       );
 
       if (loginResponse.data.error) {
@@ -955,21 +928,17 @@ export class DriverService {
         // Obtener datos de la unidad con flags para posición
         // flags: 1 (base) + 256 (position) + 1024 (last message) = 1281
         const unitResponse = await firstValueFrom(
-          this.httpService.get(
-            process.env.WIALON_API_URL ||
-              'https://hst-api.wialon.com/wialon/ajax.html',
-            {
-              params: {
-                svc: 'core/search_item',
-                params: JSON.stringify({
-                  id: Number(unitId),
-                  flags: 1281,
-                }),
-                sid: sessionId,
-              },
-              timeout: 10000,
+          this.httpService.get(wialonApiUrl, {
+            params: {
+              svc: 'core/search_item',
+              params: JSON.stringify({
+                id: Number(unitId),
+                flags: 1281,
+              }),
+              sid: sessionId,
             },
-          ),
+            timeout: 10000,
+          }),
         );
 
         const unitData = unitResponse.data.item;
@@ -1001,13 +970,9 @@ export class DriverService {
       } finally {
         // Logout de Wialon para liberar sesión
         await firstValueFrom(
-          this.httpService.get(
-            process.env.WIALON_API_URL ||
-              'https://hst-api.wialon.com/wialon/ajax.html',
-            {
-              params: { svc: 'core/logout', params: '{}', sid: sessionId },
-            },
-          ),
+          this.httpService.get(wialonApiUrl, {
+            params: { svc: 'core/logout', params: '{}', sid: sessionId },
+          }),
         ).catch(() => {});
       }
     } catch (error) {
@@ -1131,10 +1096,6 @@ export class DriverService {
           { merge: true },
         );
 
-      this.logger.log(
-        `📍 Ubicación actualizada unit=${unitId} ride=${rideId || 'N/A'} lat=${latitude} lng=${longitude}`,
-      );
-
       // Actualizar approach en Firestore de forma tolerante a fallos
       if (
         rideId !== undefined &&
@@ -1241,7 +1202,9 @@ export class DriverService {
         });
       }
     } catch (err) {
-      this.logger.warn(`[push] notifyArrival falló para ride ${rideId}: ${err}`);
+      this.logger.warn(
+        `[push] notifyArrival falló para ride ${rideId}: ${err}`,
+      );
     }
   }
 
@@ -1349,8 +1312,6 @@ export class DriverService {
     try {
       const db = this.firebaseService.getFirestore();
 
-      this.logger.log(`📸 Actualizando foto de perfil para usuario: ${userId}`);
-
       await db.collection('users').doc(userId).set(
         {
           photoURL,
@@ -1358,8 +1319,6 @@ export class DriverService {
         },
         { merge: true },
       );
-
-      this.logger.log(`✅ Foto de perfil actualizada para usuario: ${userId}`);
 
       return {
         success: true,
@@ -1383,8 +1342,6 @@ export class DriverService {
     try {
       const db = this.firebaseService.getFirestore();
 
-      this.logger.log(`🏢 Actualizando logo para empresa: ${companyId}`);
-
       await db.collection('users').doc(companyId).set(
         {
           logoURL,
@@ -1392,8 +1349,6 @@ export class DriverService {
         },
         { merge: true },
       );
-
-      this.logger.log(`✅ Logo actualizado para empresa: ${companyId}`);
 
       return {
         success: true,
@@ -1427,10 +1382,6 @@ export class DriverService {
       const db = this.firebaseService.getFirestore();
       const now = new Date().toISOString();
 
-      this.logger.log(
-        `🎫 Check-in de pasajero: ${passengerId} en ride ${rideId}`,
-      );
-
       // 1. Obtener datos del pasajero desde Firestore
       const passengerDoc = await db.collection('users').doc(passengerId).get();
       const passengerData = passengerDoc.data();
@@ -1441,10 +1392,6 @@ export class DriverService {
         passengerData?.name ||
         passengerData?.displayName ||
         'Desconocido';
-
-      this.logger.log(
-        `👤 Pasajero identificado: ${passengerNameForResponse} (ID: ${passengerId})`,
-      );
 
       // 3. Registrar el check-in en la subcolección del ride
       const checkInRef = db
@@ -1474,10 +1421,6 @@ export class DriverService {
           lastCheckIn: now,
         },
         { merge: true },
-      );
-
-      this.logger.log(
-        `✅ Check-in exitoso: ${passengerNameForResponse} abordó el viaje ${rideId}`,
       );
 
       return {
@@ -1540,8 +1483,6 @@ export class DriverService {
     try {
       const db = this.firebaseService.getFirestore();
 
-      this.logger.log(`🔍 Escaneando QR de pasajero: ${qr}`);
-
       // Buscar en la colección user_tokens usando el QR como ID del documento
       const tokenDoc = await db.collection('user_tokens').doc(qr).get();
 
@@ -1569,10 +1510,6 @@ export class DriverService {
       const passengerIdResolved =
         userData?.userId || passengerId || tokenDoc.id;
 
-      this.logger.log(
-        `👤 Pasajero identificado: ${passengerName} (ID: ${passengerIdResolved})`,
-      );
-
       // Guardar el abordaje en la colección boardings
       const boardingData = {
         shiftId: shiftId || null,
@@ -1590,15 +1527,7 @@ export class DriverService {
         source: 'app_chofer',
       };
 
-      this.logger.log(
-        `💾 Guardando abordaje en boardings: ${JSON.stringify(boardingData)}`,
-      );
-
       await db.collection('boardings').add(boardingData);
-
-      this.logger.log(
-        `✅ Abordaje guardado en boardings: ${passengerName} en ride ${rideId}`,
-      );
 
       // Push de abordaje al pasajero escaneado (no rompe el flujo si falla).
       // El routeName viene en el payload del conductor (ya lo tiene en memoria),
@@ -1620,8 +1549,6 @@ export class DriverService {
           .update({
             currentOccupancy: FieldValue.increment(1),
           });
-
-        this.logger.log(`📊 currentOccupancy incrementado en turno ${shiftId}`);
       }
 
       return {

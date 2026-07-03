@@ -85,9 +85,16 @@ export class NimbusService {
   }
 
   public async getNimbusToken(uid: string): Promise<string> {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+
     // Resolución multi-tenant unificada: token propio -> proveedor (companies
     // -> adminUid) -> settings/ttc para super_admin. Ver FirebaseService.
-    const token = await this.firebaseService.resolveProviderToken(uid, 'nimbus');
+    const token = await this.firebaseService.resolveProviderToken(
+      uid,
+      'nimbus',
+    );
     if (!token) {
       throw new BadRequestException(
         'El usuario no tiene token de Nimbus configurado.',
@@ -98,11 +105,13 @@ export class NimbusService {
 
   async getStopDetails(uid: string, depotId: string, stopId: string) {
     const token = await this.getNimbusToken(uid);
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const res = await firstValueFrom(
-      this.httpService.get(
-        `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stop/${stopId}`,
-        { headers: { Authorization: `Token ${token}` }, timeout: 30000 },
-      ),
+      this.httpService.get(`${nimbusApiUrl}/depot/${depotId}/stop/${stopId}`, {
+        headers: { Authorization: `Token ${token}` },
+        timeout: 30000,
+      }),
     );
     return { success: true, stopDetails: res.data };
   }
@@ -123,14 +132,15 @@ export class NimbusService {
 
     // Obtener token y hacer petición a Nimbus
     const token = await this.getNimbusToken(uid);
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
     const stopsMap = new Map<number, StopDetail>();
 
     try {
       const res = await firstValueFrom(
-        this.httpService.get(
-          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stops`,
-          { headers: { Authorization: `Token ${token}` }, timeout: 30000 },
-        ),
+        this.httpService.get(`${nimbusApiUrl}/depot/${depotId}/stops`, {
+          headers: { Authorization: `Token ${token}` },
+          timeout: 30000,
+        }),
       );
 
       const stops = res.data.stops || [];
@@ -162,9 +172,6 @@ export class NimbusService {
         timestamp: Date.now(),
       });
 
-      this.logger.log(
-        `✅ Mapa de paradas creado para depot ${depotId}: ${stopsMap.size} paradas`,
-      );
       return stopsMap;
     } catch (error) {
       this.logger.error(
@@ -176,26 +183,22 @@ export class NimbusService {
 
   async getGroups(uid: string) {
     const token = await this.getNimbusToken(uid);
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const depotsRes = await firstValueFrom(
-      this.httpService.get(
-        `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
-        {
-          headers: { Authorization: `Token ${token}` },
-          timeout: 30000,
-        },
-      ),
+      this.httpService.get(`${nimbusApiUrl}/depots`, {
+        headers: { Authorization: `Token ${token}` },
+        timeout: 30000,
+      }),
     );
     const allGroups: any[] = [];
 
     for (const depot of depotsRes.data.depots || []) {
       const gRes = await firstValueFrom(
-        this.httpService.get(
-          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/groups`,
-          {
-            headers: { Authorization: `Token ${token}` },
-            timeout: 30000,
-          },
-        ),
+        this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/groups`, {
+          headers: { Authorization: `Token ${token}` },
+          timeout: 30000,
+        }),
       );
       const groups =
         gRes.data.groups || gRes.data.items || Object.values(gRes.data);
@@ -210,12 +213,13 @@ export class NimbusService {
     depotId: string,
   ): Promise<RouteDetailResponse> {
     const token = await this.getNimbusToken(uid);
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
 
     try {
       // Hacer peticiones en paralelo para reducir el tiempo de respuesta de 5s a 1s
-      const nimbusUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/routes`;
-      const detailUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/route/${routeId}`;
-      const ridesUrl = `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/rides`;
+      const nimbusUrl = `${nimbusApiUrl}/depot/${depotId}/routes`;
+      const detailUrl = `${nimbusApiUrl}/depot/${depotId}/route/${routeId}`;
+      const ridesUrl = `${nimbusApiUrl}/depot/${depotId}/rides`;
 
       const [routesResponse, detailResponse, stopsMapRaw, ridesRes] =
         await Promise.all([
@@ -280,10 +284,6 @@ export class NimbusService {
       let unitId: string | null = null;
       let unitName: string | null = null;
 
-      this.logger.log(
-        `📊 Ruta ${routeId} en Depot ${depotId}: Encontrados ${rides.length} viajes activos`,
-      );
-
       // Buscar si esta ruta tiene un viaje activo
       // CRÍTICO: Extraer unitId incondicionalmente, sin importar el estado del conductor
       for (const ride of rides) {
@@ -300,10 +300,6 @@ export class NimbusService {
             break;
           }
         }
-      }
-
-      if (!unitId) {
-        this.logger.log(`📊 Ruta ${routeId}: No hay viaje activo asignado`);
       }
 
       // Data Shaping: Formatear ruta con coordenadas completas y geometría real
@@ -337,14 +333,13 @@ export class NimbusService {
 
   async getRoutes(uid: string): Promise<RoutesResponse> {
     const token = await this.getNimbusToken(uid);
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const depotsRes = await firstValueFrom(
-      this.httpService.get(
-        `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
-        {
-          headers: { Authorization: `Token ${token}` },
-          timeout: 30000,
-        },
-      ),
+      this.httpService.get(`${nimbusApiUrl}/depots`, {
+        headers: { Authorization: `Token ${token}` },
+        timeout: 30000,
+      }),
     );
     const shapedRoutes: ShapedRoute[] = [];
 
@@ -356,13 +351,10 @@ export class NimbusService {
 
       // Obtener rutas del depot
       const routesRes = await firstValueFrom(
-        this.httpService.get(
-          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/routes`,
-          {
-            headers: { Authorization: `Token ${token}` },
-            timeout: 30000,
-          },
-        ),
+        this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/routes`, {
+          headers: { Authorization: `Token ${token}` },
+          timeout: 30000,
+        }),
       );
 
       const routes = routesRes.data.routes || [];
@@ -374,47 +366,34 @@ export class NimbusService {
       >();
       try {
         const ridesRes = await firstValueFrom(
-          this.httpService.get(
-            `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
-            {
-              headers: { Authorization: `Token ${token}` },
-              timeout: 8000,
-              'axios-retry': { retries: 0 },
-            } as any,
-          ),
+          this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/rides`, {
+            headers: { Authorization: `Token ${token}` },
+            timeout: 8000,
+            'axios-retry': { retries: 0 },
+          } as any),
         );
 
         const rides = ridesRes.data.rides || [];
 
-        this.logger.log(
-          `📊 Depot ${depot.id}: Encontrados ${rides.length} viajes activos`,
-        );
-
         for (const ride of rides) {
-          if (ride.tid && ride.u) {
-            for (const route of routes) {
-              if (route.tt && Array.isArray(route.tt)) {
-                const hasThisTimetable = route.tt.some(
-                  (tt: any) => tt.id === ride.tid,
-                );
-                if (hasThisTimetable) {
-                  const routeKey = String(route.id);
-                  const unitId = String(ride.u);
-                  const unitName = `U ${ride.u}`;
+          if (!ride.tid || !ride.u) continue;
+          for (const route of routes) {
+            if (route.tt && Array.isArray(route.tt)) {
+              const hasThisTimetable = route.tt.some(
+                (tt: any) => tt.id === ride.tid,
+              );
+              if (hasThisTimetable) {
+                const routeKey = String(route.id);
+                const unitId = String(ride.u);
+                const unitName = `U ${ride.u}`;
 
-                  activeRidesMap.set(routeKey, {
-                    unitId,
-                    unitName,
-                  });
+                activeRidesMap.set(routeKey, {
+                  unitId,
+                  unitName,
+                });
 
-                  break;
-                }
+                break;
               }
-            }
-          } else {
-            if (!ride.tid) {
-            }
-            if (!ride.u) {
             }
           }
         }
@@ -477,6 +456,11 @@ export class NimbusService {
 
   @Cron(CronExpression.EVERY_MINUTE)
   async syncActiveRidesWithNimbus() {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const db = this.firebaseService.getFirestore();
 
     try {
@@ -521,10 +505,10 @@ export class NimbusService {
 
         try {
           const depotsResponse = await firstValueFrom(
-            this.httpService.get(
-              `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
-              { headers, timeout: 30000 },
-            ),
+            this.httpService.get(`${nimbusApiUrl}/depots`, {
+              headers,
+              timeout: 30000,
+            }),
           );
           const depots = depotsResponse.data.depots || [];
 
@@ -535,7 +519,7 @@ export class NimbusService {
             try {
               const stopsResponse = await firstValueFrom(
                 this.httpService.get(
-                  `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/stops`,
+                  `${nimbusApiUrl}/depot/${depot.id}/stops`,
                   { headers, timeout: 30000 },
                 ),
               );
@@ -545,18 +529,18 @@ export class NimbusService {
             } catch (err) {}
 
             const routesResponse = await firstValueFrom(
-              this.httpService.get(
-                `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/routes`,
-                { headers, timeout: 30000 },
-              ),
+              this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/routes`, {
+                headers,
+                timeout: 30000,
+              }),
             );
             const nimbusRoutes = routesResponse.data.routes || [];
 
             const ridesResponse = await firstValueFrom(
-              this.httpService.get(
-                `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
-                { headers, timeout: 30000 },
-              ),
+              this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/rides`, {
+                headers,
+                timeout: 30000,
+              }),
             );
             const nimbusLiveRides = ridesResponse.data.rides || [];
 
@@ -711,10 +695,15 @@ export class NimbusService {
       // para que la unión entre tramos no muestre saltos.
       if (coords.length < 2 && route?.overview_polyline?.points) {
         try {
-          const decoded = polyline.decode(route.overview_polyline.points) as Array<[number, number]>;
+          const decoded = polyline.decode(
+            route.overview_polyline.points,
+          ) as Array<[number, number]>;
           if (decoded.length >= 2) {
             decoded[0] = [chunk[0].lat, chunk[0].lng];
-            decoded[decoded.length - 1] = [chunk[chunk.length - 1].lat, chunk[chunk.length - 1].lng];
+            decoded[decoded.length - 1] = [
+              chunk[chunk.length - 1].lat,
+              chunk[chunk.length - 1].lng,
+            ];
             return decoded;
           }
           return [];
@@ -724,7 +713,8 @@ export class NimbusService {
       }
       return coords;
     } catch (error: any) {
-      const msg = error.response?.data?.error_message || error.message || 'error';
+      const msg =
+        error.response?.data?.error_message || error.message || 'error';
       this.logger.warn(`⚠️ Directions tramo falló: ${msg}`);
       return [];
     }
@@ -747,10 +737,6 @@ export class NimbusService {
       chunks.push(validStops.slice(i, i + MAX));
     }
 
-    this.logger.log(
-      `📍 Directions API: ${validStops.length} paradas en ${chunks.length} tramo(s)`,
-    );
-
     const allCoords: Array<[number, number]> = [];
     for (const chunk of chunks) {
       const coords = await this.fetchHighResCoordsForChunk(chunk);
@@ -766,11 +752,7 @@ export class NimbusService {
       return undefined;
     }
 
-    const encodedPath = polyline.encode(allCoords);
-    this.logger.log(
-      `✅ Directions alta resolución: ${allCoords.length} puntos (${encodedPath.length} chars)`,
-    );
-    return encodedPath;
+    return polyline.encode(allCoords);
   }
 
   private async snapToRoads(
@@ -884,9 +866,6 @@ export class NimbusService {
       }
 
       if (allSnappedPoints.length >= 2) {
-        this.logger.log(
-          `✅ Snap to Roads completado: ${validCoords.length} puntos → ${allSnappedPoints.length} puntos ajustados`,
-        );
         return allSnappedPoints;
       }
 
@@ -1075,6 +1054,11 @@ export class NimbusService {
   private async calculateRouteWithWialon(
     stops: DetailedStop[],
   ): Promise<string | undefined> {
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
+
     try {
       // Obtener token de Wialon desde Firebase (cualquier proveedor con token).
       // Acepta el rol nuevo (business_admin) y el legacy (Business Admin).
@@ -1097,16 +1081,12 @@ export class NimbusService {
 
       // Login en Wialon
       const loginResponse = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'token/login',
-              params: JSON.stringify({ token: wialonToken }),
-            },
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'token/login',
+            params: JSON.stringify({ token: wialonToken }),
           },
-        ),
+        }),
       );
 
       if (loginResponse.data.error) {
@@ -1123,21 +1103,17 @@ export class NimbusService {
 
       // Llamar al servicio de ruteo de Wialon
       const routingResponse = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'routing/calculate_route',
-              params: JSON.stringify({
-                points,
-                routingMode: 'auto', // Modo automóvil para seguir calles
-                flags: 1, // Obtener geometría detallada
-              }),
-              sid,
-            },
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'routing/calculate_route',
+            params: JSON.stringify({
+              points,
+              routingMode: 'auto', // Modo automóvil para seguir calles
+              flags: 1, // Obtener geometría detallada
+            }),
+            sid,
           },
-        ),
+        }),
       );
 
       if (routingResponse.data.error) {
@@ -1184,6 +1160,7 @@ export class NimbusService {
     depotId: number,
     token: string,
   ): Promise<Map<string, { name: string; lat: number; lng: number }>> {
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
     const stopsMap = new Map<
       string,
       { name: string; lat: number; lng: number }
@@ -1193,14 +1170,11 @@ export class NimbusService {
       // CRÍTICO: Agregar flags para obtener geometría completa de las paradas
       // flags=1 o flags=4097 solicita coordenadas y detalles completos
       const stopsResponse = await firstValueFrom(
-        this.httpService.get(
-          `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depotId}/stops`,
-          {
-            headers: { Authorization: `Token ${token}` },
-            params: { flags: 1 }, // Solicitar datos completos incluyendo coordenadas
-            timeout: 20000, // 20 segundos para evitar abortos de stream
-          },
-        ),
+        this.httpService.get(`${nimbusApiUrl}/depot/${depotId}/stops`, {
+          headers: { Authorization: `Token ${token}` },
+          params: { flags: 1 }, // Solicitar datos completos incluyendo coordenadas
+          timeout: 20000, // 20 segundos para evitar abortos de stream
+        }),
       );
 
       const stops = stopsResponse.data.stops || [];
@@ -1372,16 +1346,12 @@ export class NimbusService {
       if (snap.exists) {
         const data = snap.data();
         const isFresh =
-          data?.generatedAt &&
-          Date.now() - data.generatedAt < TTL_MS;
+          data?.generatedAt && Date.now() - data.generatedAt < TTL_MS;
         const hashMatches = data?.stopsHash === stopsHash;
         const versionMatches =
           data?.geometryVersion === NimbusService.GEOMETRY_VERSION;
 
         if (data?.encodedPath && isFresh && hashMatches && versionMatches) {
-          this.logger.log(
-            `🗺️ route_geometry HIT ${docId} (${data.pointCount || '?'} puntos)`,
-          );
           return data.encodedPath as string;
         }
       }
@@ -1406,7 +1376,6 @@ export class NimbusService {
         geometryVersion: NimbusService.GEOMETRY_VERSION,
         pointCount: polyline.decode(encodedPath).length,
       });
-      this.logger.log(`🗺️ route_geometry MISS → guardado ${docId}`);
     } catch (writeError: any) {
       this.logger.warn(
         `⚠️ No se pudo guardar route_geometry/${docId}: ${writeError.message}`,
@@ -1771,7 +1740,10 @@ export class NimbusService {
   }
 
   private get nimbusBase(): string {
-    return process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api';
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    return process.env.NIMBUS_API_URL;
   }
 
   // Construye un ShapedRoute mínimo a partir de la respuesta cruda de Nimbus
@@ -1816,17 +1788,19 @@ export class NimbusService {
     if (dto.n !== undefined) body.n = dto.n;
     if (dto.d !== undefined) body.d = dto.d;
     const res = await firstValueFrom(
-      this.httpService.patch(
-        `${this.nimbusBase}/routes/${routeId}`,
-        body,
-        { headers: { Authorization: `Token ${token}` }, timeout: 15000 },
-      ),
+      this.httpService.patch(`${this.nimbusBase}/routes/${routeId}`, body, {
+        headers: { Authorization: `Token ${token}` },
+        timeout: 15000,
+      }),
     );
     const depotId = Number(res.data?.depot_id ?? res.data?.depotId ?? 0);
     return this.toMinimalShapedRoute({ ...res.data, id: routeId }, depotId);
   }
 
-  async deleteRoute(uid: string, routeId: number): Promise<{ success: boolean }> {
+  async deleteRoute(
+    uid: string,
+    routeId: number,
+  ): Promise<{ success: boolean }> {
     const token = await this.getNimbusToken(uid);
     await firstValueFrom(
       this.httpService.delete(`${this.nimbusBase}/routes/${routeId}`, {
@@ -1844,6 +1818,11 @@ export class NimbusService {
    * @returns Objeto con position {lat, lng} y course (rumbo)
    */
   async getUnitLocation(uid: string, unitId: string) {
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
+
     try {
       // Token Wialon multi-tenant: propio -> proveedor (companies -> adminUid)
       // -> settings/ttc para super_admin. Así un pasajero hereda el de su proveedor.
@@ -1860,16 +1839,12 @@ export class NimbusService {
 
       // Login en Wialon
       const loginResponse = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'token/login',
-              params: JSON.stringify({ token: wialonToken }),
-            },
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'token/login',
+            params: JSON.stringify({ token: wialonToken }),
           },
-        ),
+        }),
       );
 
       if (loginResponse.data.error) {
@@ -1882,20 +1857,16 @@ export class NimbusService {
         // Obtener datos de la unidad específica con flags para posición
         // flags: 1 (base) + 256 (position) + 1024 (last message)
         const unitResponse = await firstValueFrom(
-          this.httpService.get(
-            process.env.WIALON_API_URL ||
-              'https://hst-api.wialon.com/wialon/ajax.html',
-            {
-              params: {
-                svc: 'core/search_item',
-                params: JSON.stringify({
-                  id: unitId,
-                  flags: 1281, // 1 + 256 + 1024
-                }),
-                sid: sessionId,
-              },
+          this.httpService.get(wialonApiUrl, {
+            params: {
+              svc: 'core/search_item',
+              params: JSON.stringify({
+                id: unitId,
+                flags: 1281, // 1 + 256 + 1024
+              }),
+              sid: sessionId,
             },
-          ),
+          }),
         );
 
         const unitData = unitResponse.data.item;
@@ -1908,11 +1879,7 @@ export class NimbusService {
         const position = unitData.pos || {};
         const lat = position.y || 0;
         const lng = position.x || 0;
-        const course = position.c || 0; // course/rumbo en grados
-
-        this.logger.log(
-          `📍 Ubicación de unidad ${unitId}: lat=${lat}, lng=${lng}, course=${course}`,
-        );
+        const course = position.c || 0;
 
         return {
           success: true,
@@ -1927,13 +1894,9 @@ export class NimbusService {
       } finally {
         // Logout de Wialon para liberar la sesión
         await firstValueFrom(
-          this.httpService.get(
-            process.env.WIALON_API_URL ||
-              'https://hst-api.wialon.com/wialon/ajax.html',
-            {
-              params: { svc: 'core/logout', params: '{}', sid: sessionId },
-            },
-          ),
+          this.httpService.get(wialonApiUrl, {
+            params: { svc: 'core/logout', params: '{}', sid: sessionId },
+          }),
         );
       }
     } catch (error) {

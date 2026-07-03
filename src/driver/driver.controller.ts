@@ -227,10 +227,8 @@ export class DriverController {
   @HttpCode(200)
   async scanPassenger(@Body() dto: ScanPassengerDto) {
     try {
-      console.log('📥 POST /api/driver/scan-passenger recibido:', dto);
       return await this.driverService.scanPassenger(dto);
     } catch (error) {
-      console.error('❌ Error en scan-passenger:', error);
       if (error instanceof HttpException) {
         throw error;
       }

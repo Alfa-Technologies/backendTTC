@@ -39,7 +39,6 @@ export class PushService {
       );
 
       if (tokenByUid.size === 0) {
-        this.logger.log('[push] sin tokens válidos para enviar');
         return;
       }
 
@@ -142,7 +141,6 @@ export class PushService {
         .collection('users')
         .doc(uid)
         .update({ expoPushToken: FieldValue.delete() });
-      this.logger.log(`[push] token inválido eliminado de users/${uid}`);
     } catch {
       /* no-op */
     }

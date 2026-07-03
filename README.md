@@ -4,13 +4,14 @@
   <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
 </p>
 
-Backend desarrollado con NestJS para la gestión y monitoreo de flotas de transporte, integrando Wialon y Nimbus APIs con Firebase.
+Backend desarrollado con **NestJS** para la gestión y monitoreo en tiempo real de flotas de transporte de personal. Integra las APIs de **Wialon** y **Nimbus** (rastreo GPS y gestión de rutas/paradas) con **Firebase** (Firestore como base de datos y Firebase Auth para autenticación), y envía notificaciones push a choferes y pasajeros vía **Expo**.
 
 ## 📋 Tabla de Contenidos
 
 - [Requisitos Previos](#requisitos-previos)
 - [Tecnologías Utilizadas](#tecnologías-utilizadas)
 - [Arquitectura del Proyecto](#arquitectura-del-proyecto)
+- [Modelo de Datos (Firestore)](#modelo-de-datos-firestore)
 - [Instalación y Configuración](#instalación-y-configuración)
 - [Variables de Entorno](#variables-de-entorno)
 - [Ejecución del Proyecto](#ejecución-del-proyecto)
@@ -19,6 +20,7 @@ Backend desarrollado con NestJS para la gestión y monitoreo de flotas de transp
 - [Endpoints API](#endpoints-api)
 - [Seguridad y Autenticación](#seguridad-y-autenticación)
 - [Tareas Programadas](#tareas-programadas)
+- [Notificaciones Push](#notificaciones-push)
 - [Desarrollo](#desarrollo)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
@@ -46,16 +48,20 @@ gcloud --version  # Debe mostrar la versión de gcloud
 
 ## 🚀 Tecnologías Utilizadas
 
-| Tecnología         | Versión | Propósito                       |
-| ------------------ | ------- | ------------------------------- |
-| NestJS             | 11.x    | Framework backend               |
-| TypeScript         | 5.7.x   | Lenguaje de programación        |
-| Firebase Admin SDK | 13.7.x  | Base de datos y autenticación   |
-| Axios              | 1.14.x  | Cliente HTTP                    |
-| class-validator    | 0.15.x  | Validación de DTOs              |
-| class-transformer  | 0.5.x   | Transformación de objetos       |
-| @nestjs/schedule   | 6.1.x   | Cron jobs                       |
-| @nestjs/config     | 4.0.x   | Gestión de variables de entorno |
+| Tecnología            | Versión | Propósito                                     |
+| --------------------- | ------- | --------------------------------------------- |
+| NestJS                | 11.x    | Framework backend                             |
+| TypeScript            | 5.7.x   | Lenguaje de programación                      |
+| Firebase Admin SDK    | 13.7.x  | Base de datos (Firestore) y autenticación     |
+| Axios (@nestjs/axios) | 1.14.x  | Cliente HTTP para Wialon/Nimbus/Google APIs   |
+| axios-retry           | 4.5.x   | Reintentos automáticos en llamadas HTTP       |
+| class-validator       | 0.15.x  | Validación de DTOs                            |
+| class-transformer     | 0.5.x   | Transformación/tipado de objetos              |
+| @nestjs/schedule      | 6.1.x   | Cron jobs                                     |
+| @nestjs/config        | 4.0.x   | Gestión de variables de entorno               |
+| @mapbox/polyline      | 1.2.x   | Codificación/decodificación de polilíneas GPS |
+| expo-server-sdk       | 6.1.x   | Envío de notificaciones push (Expo)           |
+| dayjs                 | 1.11.x  | Manejo de fechas                              |
 
 ---
 
@@ -63,21 +69,48 @@ gcloud --version  # Debe mostrar la versión de gcloud
 
 El proyecto sigue una arquitectura modular de NestJS con las siguientes características:
 
-- **Módulos independientes**: Cada funcionalidad está encapsulada en su propio módulo
-- **Inyección de dependencias**: Uso extensivo del patrón DI de NestJS
-- **DTOs con validación**: Todas las entradas son validadas automáticamente
-- **Guards globales**: Autenticación centralizada con Firebase Auth
-- **Servicios centralizados**: Firebase Service como única fuente de verdad
-- **Cron Jobs**: Sincronización automática cada minuto con Nimbus API
+- **Módulos independientes**: Cada funcionalidad está encapsulada en su propio módulo (`Module` + `Controller` + `Service`)
+- **Inyección de dependencias**: Uso extensivo del patrón DI de NestJS; ningún servicio de negocio inicializa Firebase directamente
+- **DTOs con validación**: Todas las entradas (`POST`/`PATCH`/`PUT`, y queries) son validadas automáticamente con `class-validator`
+- **Guard global**: `FirebaseAuthGuard` protege todos los endpoints por defecto (opt-out explícito con `@Public()`)
+- **Servicio centralizado de Firebase**: `FirebaseService` es la única fuente de verdad para Firestore y Firebase Auth
+- **Cron Jobs**: Sincronización automática cada minuto de los viajes activos con Nimbus API
+- **Multi-tenant**: La resolución de credenciales de Wialon/Nimbus es jerárquica por usuario → empresa → configuración maestra (ver [`FirebaseService.resolveProviderToken`](#seguridad-y-autenticación))
 
 ### Módulos Principales
 
 ```
-├── AppModule (Raíz)
-├── FirebaseModule (Conexión a Firebase)
-├── WialonModule (Integración con Wialon API)
-└── NimbusModule (Integración con Nimbus API + Cron Jobs)
+AppModule (raíz)
+├── ConfigModule            # Variables de entorno (global)
+├── ScheduleModule          # Habilita los @Cron() jobs
+├── FirebaseModule          # FirebaseService (Firestore + Auth) — exportado a todos los módulos
+├── WialonModule            # Integración directa con Wialon API
+├── NimbusModule            # Integración con Nimbus API (rutas, paradas, unidades) + cron de sincronización
+├── DriverModule            # Lógica de turnos del chofer (usa NimbusModule y PushModule)
+├── PassengerModule         # Vista de viaje activo del pasajero (usa DriverModule y NimbusModule)
+└── PushModule              # Envío de notificaciones push (Expo) — usado por DriverModule
 ```
+
+**Nota:** existe un `UpdateUserDto` en `src/user/dto/` que actualmente no está conectado a ningún controlador/módulo activo (no hay `UserModule` registrado en `AppModule`). Queda como referencia para una futura ruta de actualización de perfil de usuario.
+
+---
+
+## 🗄️ Modelo de Datos (Firestore)
+
+La base de datos es **Firestore** (nombre configurable vía `FIREBASE_DATABASE_NAME`). No hay ORM: cada servicio accede a las colecciones a través de `firebaseService.getFirestore()`. Las colecciones principales usadas por el backend son:
+
+| Colección            | Descripción                                                                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `users`              | Usuarios de la app (choferes, pasajeros, admins). Guarda `role`, `companyId`, `plantId`, tokens de proveedor (`wialonToken`/`nimbusToken`), `expoPushToken` |
+| `companies`          | Empresas cliente. Cada doc tiene `adminUid`, usado para heredar tokens de Wialon/Nimbus                                                                     |
+| `settings`           | Configuración global; el doc `ttc` guarda tokens "maestro" usados por `super_admin` sin empresa                                                             |
+| `plants`             | Plantas/sedes; `routeIds` filtra qué rutas de Nimbus puede ver un usuario asignado a una planta                                                             |
+| `shifts`             | Turnos de chofer (`ACTIVE`/`COMPLETED`), creados en `start-shift` y cerrados en `end-shift`                                                                 |
+| `rides`              | Viajes/recorridos activos e históricos, sincronizados cada minuto desde Nimbus                                                                              |
+| `boardings`          | Registro de abordaje de pasajeros (check-in / escaneo de QR) por turno o viaje                                                                              |
+| `waiting_passengers` | Pasajeros esperando una ruta; se usa para notificar aproximación de la unidad                                                                               |
+| `route_geometry`     | Caché de polilíneas (`encodedPath`) de alta resolución generadas con Google Directions API, con TTL de 30 días e invalidación por hash de paradas           |
+| `notifications`      | Buzón de notificaciones persistido para cada usuario (independiente del envío push)                                                                         |
 
 ---
 
@@ -161,8 +194,9 @@ NIMBUS_API_URL=https://nimbus.wialon.com/api
 | `PORT`                   | Puerto donde corre el servidor       | `3000`             | No        |
 | `FIREBASE_PROJECT_ID`    | ID del proyecto de Firebase          | `apptransportettc` | Sí        |
 | `FIREBASE_DATABASE_NAME` | Nombre de la base de datos Firestore | `transporte-db`    | Sí        |
-| `WIALON_API_URL`         | URL de la API de Wialon              | Ver `.env.example` | Sí        |
-| `NIMBUS_API_URL`         | URL de la API de Nimbus              | Ver `.env.example` | Sí        |
+| `WIALON_API_URL`         | URL de la API de Wialon              | Ninguno            | Sí        |
+| `NIMBUS_API_URL`         | URL de la API de Nimbus              | Ninguno            | Sí        |
+| `GOOGLE_MAPS_API_KEY`    | API Key de Google Maps Directions    | Ninguno            | Opcional  |
 
 ### Seguridad de Variables
 
@@ -603,32 +637,58 @@ backend-ttc/
 │   ├── app.service.ts             # Servicio raíz
 │   ├── main.ts                    # Punto de entrada de la aplicación
 │   │
-│   ├── firebase/                  # Módulo de Firebase
-│   │   ├── firebase.module.ts     # Configuración del módulo
-│   │   ├── firebase.service.ts    # Servicio centralizado de Firebase
+│   ├── firebase/                  # Módulo centralizado de Firebase
+│   │   ├── firebase.module.ts     # Exporta FirebaseService a toda la app
+│   │   ├── firebase.service.ts    # Init de Firebase Admin (3 métodos de auth) + Firestore/Auth + resolveProviderToken
 │   │   ├── guards/
-│   │   │   └── firebase-auth.guard.ts  # Guard de autenticación global
+│   │   │   └── firebase-auth.guard.ts    # Guard global: valida Bearer token de Firebase Auth
 │   │   └── decorators/
-│   │       ├── public.decorator.ts      # Decorador @Public()
-│   │       └── current-user.decorator.ts # Decorador @CurrentUser()
+│   │       ├── public.decorator.ts       # @Public() para excluir un endpoint del guard
+│   │       └── current-user.decorator.ts # @CurrentUser() inyecta el token decodificado
 │   │
-│   ├── wialon/                    # Módulo de Wialon
-│   │   ├── wialon.module.ts       # Configuración del módulo
-│   │   ├── wialon.controller.ts   # Endpoints de Wialon
-│   │   ├── wialon.service.ts      # Lógica de negocio Wialon
+│   ├── wialon/                    # Integración directa con Wialon API
+│   │   ├── wialon.module.ts
+│   │   ├── wialon.controller.ts   # Endpoints /api/wialon/*
+│   │   ├── wialon.service.ts
+│   │   └── dto/verify-token.dto.ts
+│   │
+│   ├── nimbus/                    # Integración con Nimbus API (rutas, paradas, unidades)
+│   │   ├── nimbus.module.ts
+│   │   ├── nimbus.controller.ts   # Endpoints /api/nimbus/*
+│   │   ├── nimbus.service.ts      # Lógica de negocio + @Cron sync + caché de geometría
+│   │   ├── examples/              # Payloads de ejemplo de la API de Nimbus (referencia)
+│   │   ├── interfaces/            # Tipos de las respuestas de Nimbus
 │   │   └── dto/
-│   │       └── verify-token.dto.ts # DTOs con validación
+│   │       ├── get-stop-details.dto.ts
+│   │       ├── get-route-by-id.dto.ts
+│   │       ├── create-route.dto.ts
+│   │       └── update-route.dto.ts
 │   │
-│   └── nimbus/                    # Módulo de Nimbus
-│       ├── nimbus.module.ts       # Configuración del módulo
-│       ├── nimbus.controller.ts   # Endpoints de Nimbus
-│       ├── nimbus.service.ts      # Lógica de negocio + Cron Jobs
-│       └── dto/
-│           └── get-stop-details.dto.ts # DTOs con validación
+│   ├── driver/                    # Flujo completo del chofer (turnos, ubicación, pasajeros)
+│   │   ├── driver.module.ts
+│   │   ├── driver.controller.ts   # Endpoints /api/driver/*
+│   │   ├── driver.service.ts      # Lógica de negocio más extensa del backend
+│   │   └── dto/                   # start-shift, end-shift, update-location, scan-passenger, etc.
+│   │
+│   ├── passenger/                 # Vista de viaje activo del pasajero
+│   │   ├── passenger.module.ts
+│   │   ├── passenger.controller.ts # Endpoints /api/passenger/*
+│   │   ├── passenger.service.ts
+│   │   └── dto/active-trip-query.dto.ts
+│   │
+│   ├── push/                      # Notificaciones push (Expo) — sin controlador, solo servicio inyectable
+│   │   ├── push.module.ts
+│   │   └── push.service.ts
+│   │
+│   └── user/                      # DTO de referencia (aún no conectado a un controlador/módulo)
+│       └── dto/update-user.dto.ts
 │
 ├── .env                           # Variables de entorno (NO COMMITEAR)
 ├── .env.example                   # Plantilla de variables de entorno
 ├── .gitignore                     # Archivos ignorados por Git
+├── Dockerfile                     # Build multi-stage para producción
+├── docker-compose.yml             # Orquestación local/producción con Docker
+├── convert-firebase-key.js        # Script helper: firebase-key.json -> variable de entorno
 ├── package.json                   # Dependencias y scripts
 ├── tsconfig.json                  # Configuración de TypeScript
 ├── nest-cli.json                  # Configuración de NestJS CLI
@@ -647,26 +707,56 @@ Todos los endpoints (excepto `/`) requieren un token de Firebase Auth en el head
 Authorization: Bearer <firebase-id-token>
 ```
 
+El usuario decodificado (`DecodedIdToken` de Firebase Admin) queda disponible en los controladores vía `@CurrentUser()`.
+
 ### Endpoints Públicos
 
 | Método | Endpoint | Descripción  |
 | ------ | -------- | ------------ |
 | GET    | `/`      | Health check |
 
-### Endpoints de Wialon
+### Endpoints de Wialon (`/api/wialon`)
 
-| Método | Endpoint                   | Descripción                  | Body/Query          |
-| ------ | -------------------------- | ---------------------------- | ------------------- |
-| POST   | `/api/wialon/verify-token` | Verifica token de Wialon     | `{ token: string }` |
-| GET    | `/api/wialon/units`        | Obtiene unidades del usuario | -                   |
+| Método | Endpoint        | Descripción                             | Body/Query          |
+| ------ | --------------- | --------------------------------------- | ------------------- |
+| POST   | `/verify-token` | Verifica un token de Wialon             | `{ token: string }` |
+| GET    | `/units`        | Unidades (vehículos) del usuario        | -                   |
+| GET    | `/positions`    | Posiciones GPS actuales de las unidades | -                   |
 
-### Endpoints de Nimbus
+### Endpoints de Nimbus (`/api/nimbus`)
 
-| Método | Endpoint             | Descripción            | Query Params        |
-| ------ | -------------------- | ---------------------- | ------------------- |
-| GET    | `/api/nimbus/stop`   | Detalles de una parada | `depotId`, `stopId` |
-| GET    | `/api/nimbus/groups` | Obtiene grupos         | -                   |
-| GET    | `/api/nimbus/routes` | Obtiene rutas          | -                   |
+| Método | Endpoint                 | Descripción                                     | Body/Query                   |
+| ------ | ------------------------ | ----------------------------------------------- | ---------------------------- |
+| GET    | `/stop`                  | Detalles de una parada                          | Query: `depotId`, `stopId`   |
+| GET    | `/groups`                | Grupos (depots) del usuario                     | -                            |
+| GET    | `/routes`                | Lista de rutas (filtradas por planta si aplica) | -                            |
+| GET    | `/routes/:routeId`       | Detalle de una ruta con paradas y geometría     | Query: `depotId`             |
+| GET    | `/unit/:unitId/location` | Ubicación actual de una unidad                  | -                            |
+| POST   | `/depot/:depotId/routes` | Crea una ruta en Nimbus                         | `{ n: string, d?: string }`  |
+| PATCH  | `/routes/:routeId`       | Actualiza una ruta                              | `{ n?: string, d?: string }` |
+| DELETE | `/routes/:routeId`       | Elimina una ruta                                | -                            |
+
+### Endpoints del Chofer (`/api/driver`)
+
+| Método | Endpoint                  | Descripción                                                                             | Body/Query (campos requeridos en negrita)                                                                                                                                         |
+| ------ | ------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/available-routes`       | Rutas/turnos disponibles para la unidad del chofer hoy                                  | `{ **unitId**, **companyId**, date?, forceRefresh? }`                                                                                                                             |
+| POST   | `/start-shift`            | Inicia un turno; crea doc en `shifts` e hidrata la ruta con `encodedPath`               | `{ **driverId**, **companyId**, **unitId**, **depotId**, **rideId**, **routeId**, routeName?, stops?, stopsCount?, unitName?, capacity?, encodedPath?, timeRange?, driverName? }` |
+| POST   | `/end-shift`              | Finaliza un turno activo y cierra el viaje en `rides`                                   | `{ **shiftId**, driverId?, companyId?, unitId?, rideId?, depotId? }`                                                                                                              |
+| GET    | `/active-shift`           | Turno activo de un chofer, con pasajeros ya abordados                                   | Query: `driverId`                                                                                                                                                                 |
+| GET    | `/shift/:rideId/approach` | Calcula la aproximación de la unidad a una parada                                       | Query: `companyId, unitId, depotId, routeId, stopIndex, lat, lng`                                                                                                                 |
+| GET    | `/unit-location/:unitId`  | Posición GPS actual de una unidad (vía Wialon)                                          | -                                                                                                                                                                                 |
+| POST   | `/location`               | Recibe telemetría GPS del chofer y la persiste (dispara notificaciones de aproximación) | `{ **unitId**, **latitude**, **longitude**, rideId?, shiftId?, course?, speed?, accuracy?, stopIndex?, currentStopIndex?, routeId?, depotId?, companyId?, timestamp? }`           |
+| POST   | `/update-profile-photo`   | Actualiza la foto de perfil del chofer                                                  | `{ **userId**, **photoURL** }` (URL válida)                                                                                                                                       |
+| POST   | `/update-company-logo`    | Actualiza el logo de la empresa                                                         | `{ **companyId**, **logoURL** }` (URL válida)                                                                                                                                     |
+| POST   | `/check-in-passenger`     | Registra el check-in manual de un pasajero                                              | `{ **passengerId**, **rideId**, **unitId**, **companyId**, routeId?, stopId? }`                                                                                                   |
+| POST   | `/scan-passenger`         | Registra el abordaje de un pasajero vía escaneo de QR                                   | `{ **companyId**, **passengerId**, **qr**, **rideId**, **unitId**, shiftId?, passengerName?, scannedAt?, stopIndex?, stopName?, routeName?, lat?, lng?, latitude?, longitude? }`  |
+
+### Endpoints del Pasajero (`/api/passenger`)
+
+| Método | Endpoint                | Descripción                                         | Body/Query                         |
+| ------ | ----------------------- | --------------------------------------------------- | ---------------------------------- |
+| GET    | `/active-trip/:routeId` | Viaje activo de la ruta para el usuario autenticado | Query: `targetStopId?`, `depotId?` |
 
 ### Ejemplo de Uso
 
@@ -685,21 +775,32 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ### Firebase Auth Guard
 
-El proyecto implementa un **Guard Global** que protege automáticamente todos los endpoints:
+El proyecto implementa un **Guard Global** (`FirebaseAuthGuard`, registrado como `APP_GUARD` en `app.module.ts`) que protege automáticamente todos los endpoints:
 
 1. **Validación automática**: Cada request es interceptado por `FirebaseAuthGuard`
-2. **Verificación de token**: El token JWT es validado con Firebase Auth
-3. **Inyección de usuario**: El usuario decodificado se inyecta en `request.user`
-4. **Acceso seguro**: Los controladores usan `@CurrentUser()` para obtener el usuario
+2. **Excepción explícita**: Un endpoint solo se libera del guard con el decorador `@Public()` (usado hoy únicamente en `AppController.getHello`)
+3. **Verificación de token**: El token JWT (`Authorization: Bearer <token>`) es validado con `firebaseService.getAuth().verifyIdToken()`
+4. **Inyección de usuario**: El token decodificado se inyecta en `request.user`
+5. **Acceso seguro**: Los controladores usan `@CurrentUser()` para obtener el usuario (`user.uid`, etc.)
+
+### Resolución de Tokens Multi-Tenant (Wialon/Nimbus)
+
+Cada usuario puede consumir Wialon/Nimbus con credenciales distintas según su rol. `FirebaseService.resolveProviderToken(uid, provider)` resuelve el token en este orden:
+
+1. **Token propio**: `users/{uid}.wialonToken` / `users/{uid}.nimbusToken`
+2. **Token heredado de la empresa**: si el usuario tiene `companyId`, se busca `companies/{companyId}.adminUid` y se usa el token de ese admin
+3. **Token maestro TTC**: si el usuario tiene `role === 'super_admin'` y no tiene empresa, se usa `settings/ttc.<token>`
+
+Si ninguno aplica, devuelve `null` y el servicio que lo llama debe manejar el caso (normalmente `BadRequestException`).
 
 ### Validación de Datos
 
-Todos los inputs son validados usando **class-validator**:
+Todos los inputs (`body` y `query`) son validados usando **class-validator**, con un `ValidationPipe` global configurado en `app.module.ts`:
 
-- `@IsNotEmpty()`: Campo requerido
-- `@IsString()`: Debe ser string
-- `@IsEmail()`: Debe ser email válido
-- Mensajes de error personalizados en español
+- `whitelist: true` — descarta propiedades no declaradas en el DTO
+- `forbidNonWhitelisted: true` — rechaza el request si trae propiedades extra
+- `transform: true` — convierte tipos automáticamente (ej. query params a `number` con `@Type(() => Number)`)
+- Mensajes de error personalizados en español en la mayoría de los DTOs (`@IsNotEmpty({ message: '...' })`)
 
 ### Buenas Prácticas Implementadas
 
@@ -707,7 +808,8 @@ Todos los inputs son validados usando **class-validator**:
 ✅ **Transform**: Convierte tipos automáticamente  
 ✅ **ForbidNonWhitelisted**: Rechaza propiedades extras  
 ✅ **No hardcoded secrets**: Todas las credenciales en variables de entorno  
-✅ **Principio de mínimo privilegio**: Solo el usuario autenticado accede a sus datos
+✅ **Principio de mínimo privilegio**: Solo el usuario autenticado accede a sus datos  
+✅ **Inyección de Firebase**: Ningún servicio de negocio llama `admin.initializeApp()` directamente; siempre se inyecta `FirebaseService`
 
 ---
 
@@ -730,9 +832,9 @@ async syncActiveRidesWithNimbus() {
 
 **Funcionalidades**:
 
-- Sincroniza viajes activos de todas las empresas
+- Sincroniza viajes activos de todas las empresas (colección `rides`)
 - Calcula progreso de rutas en tiempo real
-- Limpia viajes fantasma (>2 horas sin actualización)
+- Limpia viajes fantasma (`status == 'IN_PROGRESS'` con `lastSyncAt` de más de 2 horas)
 - Logs detallados en consola
 
 **Monitoreo**:
@@ -743,6 +845,26 @@ async syncActiveRidesWithNimbus() {
 💾 Viaje 12345_2026-04-02 (Ruta: Centro — Norte) -> Progreso: 45%
 🧹 Limpieza completada: 3 viajes fantasma cerrados.
 ```
+
+---
+
+## 🔔 Notificaciones Push
+
+El módulo `PushModule` (`src/push/push.service.ts`) envía notificaciones push vía **Expo** y es consumido por `DriverService` en varios puntos del flujo (llegada a destino, aproximación de la unidad a una parada, etc.).
+
+**Flujo de `PushService.sendToUsers(uids, payload)`**:
+
+1. Lee `expoPushToken` de `users/{uid}` para cada `uid` recibido (deduplicado)
+2. Filtra tokens inválidos con `Expo.isExpoPushToken()`
+3. Envía las notificaciones en bloques (`expo.chunkPushNotifications`)
+4. Si Expo responde `DeviceNotRegistered`, borra el token inválido de Firestore automáticamente
+5. Persiste **siempre** una copia en la colección `notifications` (buzón in-app), aunque el push no se haya podido entregar
+6. Es **tolerante a fallos**: nunca lanza una excepción que interrumpa el flujo principal (turnos, ubicación, etc.)
+
+**Disparadores actuales** (en `driver.service.ts`):
+
+- **Aproximación de unidad**: al recibir un `update-location`, evalúa `waiting_passengers` por `routeId` y notifica una sola vez por fase/umbral
+- **Llegada a destino**: al llegar a la última parada, notifica a los pasajeros con `boarding` registrado en ese `rideId` y marca `arrivalNotified` para no repetir
 
 ---
 
@@ -891,6 +1013,26 @@ yarn install
 - Verifica que `ScheduleModule.forRoot()` esté en `app.module.ts`
 - Revisa los logs para ver si hay errores
 
+### Problema: `403 Forbidden` o `400 Bad Request` al llamar a Wialon/Nimbus
+
+**Causa**: El usuario autenticado no tiene un token de proveedor resoluble (ver [Resolución de Tokens Multi-Tenant](#seguridad-y-autenticación))
+
+**Solución**:
+
+- Verifica que `users/{uid}` tenga `wialonToken`/`nimbusToken`, o
+- Verifica que `users/{uid}.companyId` apunte a un doc en `companies` con `adminUid` válido y con token, o
+- Verifica que el usuario tenga `role: 'super_admin'` y exista `settings/ttc` con el token maestro
+
+### Problema: Las notificaciones push no llegan
+
+**Causa**: El `expoPushToken` guardado en `users/{uid}` es inválido, expiró, o el dispositivo desinstaló la app
+
+**Solución**:
+
+- `PushService` limpia automáticamente los tokens con estado `DeviceNotRegistered`; revisa los logs (`[push] token inválido eliminado de users/{uid}`)
+- Confirma que el frontend esté re-registrando el `expoPushToken` al iniciar sesión
+- Revisa la colección `notifications`: si el documento se creó pero el push no llegó, el problema es del lado del token/dispositivo, no del backend
+
 ---
 
 ## 📚 Recursos Adicionales
@@ -899,18 +1041,14 @@ yarn install
 - [Firebase Admin SDK](https://firebase.google.com/docs/admin/setup)
 - [class-validator](https://github.com/typestack/class-validator)
 - [Wialon API Docs](https://sdk.wialon.com/wiki/en)
-
----
-
-## 👥 Equipo de Desarrollo
-
-Para dudas o soporte, contacta al equipo de TI.
+- [Expo Server SDK](https://github.com/expo/expo-server-sdk-node)
+- [Google Directions API](https://developers.google.com/maps/documentation/directions)
 
 ---
 
 ## 📄 Licencia
 
-UNLICENSED - Uso interno de TTC
+UNLICENSED - Uso privado
 
 ---
 

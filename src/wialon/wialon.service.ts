@@ -38,7 +38,11 @@ function inferVehicleType(name: string): string {
 
 // Extrae el código/nombre de ruta a partir del nombre de la unidad.
 function extractRoute(unitName: string): string {
-  const patterns = [/[Rr](?:uta)?\s*[-:]?\s*(\d+)/, /[Rr]\s*[-:]\s*(\d{3})/, /^(\d{3})\b/];
+  const patterns = [
+    /[Rr](?:uta)?\s*[-:]?\s*(\d+)/,
+    /[Rr]\s*[-:]\s*(\d{3})/,
+    /^(\d{3})\b/,
+  ];
   for (const pattern of patterns) {
     const match = unitName.match(pattern);
     if (match) return match[0].toUpperCase();
@@ -63,16 +67,16 @@ export class WialonService {
 
   async verifyToken(token: string) {
     if (!token) throw new BadRequestException('Falta token.');
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
 
     try {
       const response = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: { svc: 'token/login', params: JSON.stringify({ token }) },
-          },
-        ),
+        this.httpService.get(wialonApiUrl, {
+          params: { svc: 'token/login', params: JSON.stringify({ token }) },
+        }),
       );
 
       if (response.data.error) throw new BadRequestException('Token inválido');
@@ -85,6 +89,11 @@ export class WialonService {
   }
 
   async getUnits(uid: string) {
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
+
     try {
       // 1. Resolución multi-tenant: token propio -> proveedor (companies ->
       // adminUid) -> settings/ttc para super_admin. Ver FirebaseService.
@@ -101,16 +110,12 @@ export class WialonService {
 
       // 2. Login en Wialon
       const login = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'token/login',
-              params: JSON.stringify({ token: wialonToken }),
-            },
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'token/login',
+            params: JSON.stringify({ token: wialonToken }),
           },
-        ),
+        }),
       );
       const eid = login.data.eid;
 
@@ -128,28 +133,20 @@ export class WialonService {
         to: 0,
       };
       const search = await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: {
-              svc: 'core/search_items',
-              params: JSON.stringify(searchParams),
-              sid: eid,
-            },
+        this.httpService.get(wialonApiUrl, {
+          params: {
+            svc: 'core/search_items',
+            params: JSON.stringify(searchParams),
+            sid: eid,
           },
-        ),
+        }),
       );
 
       // 4. Logout de Wialon
       await firstValueFrom(
-        this.httpService.get(
-          process.env.WIALON_API_URL ||
-            'https://hst-api.wialon.com/wialon/ajax.html',
-          {
-            params: { svc: 'core/logout', params: '{}', sid: eid },
-          },
-        ),
+        this.httpService.get(wialonApiUrl, {
+          params: { svc: 'core/logout', params: '{}', sid: eid },
+        }),
       );
 
       return { success: true, units: search.data.items || [] };
@@ -164,6 +161,11 @@ export class WialonService {
     positions: WialonPosition[];
     updatedAt: number;
   }> {
+    if (!process.env.WIALON_API_URL) {
+      throw new InternalServerErrorException('WIALON_API_URL no configurada');
+    }
+    const wialonApiUrl = process.env.WIALON_API_URL;
+
     // 1. Resolver token Wialon (multi-tenant: propio -> proveedor -> TTC maestro).
     const wialonToken = await this.firebaseService.resolveProviderToken(
       uid,
@@ -181,9 +183,7 @@ export class WialonService {
       return { success: true, positions: cached.data, updatedAt: Date.now() };
     }
 
-    const apiUrl =
-      process.env.WIALON_API_URL ||
-      'https://hst-api.wialon.com/wialon/ajax.html';
+    const apiUrl = wialonApiUrl;
 
     try {
       // 3. Login.

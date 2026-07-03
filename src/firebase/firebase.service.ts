@@ -76,10 +76,6 @@ export class FirebaseService implements OnModuleInit {
       this.app,
       process.env.FIREBASE_DATABASE_NAME || 'transporte-db',
     );
-
-    this.logger.log(
-      `🔥 Firebase Admin conectado a ${process.env.FIREBASE_DATABASE_NAME || 'transporte-db'}`,
-    );
   }
 
   getFirestore() {
@@ -108,7 +104,9 @@ export class FirebaseService implements OnModuleInit {
     const field = provider === 'wialon' ? 'wialonToken' : 'nimbusToken';
     const norm = (v: unknown): string | null => {
       if (typeof v !== 'string' || !v.trim()) return null;
-      return provider === 'nimbus' ? v.replace(/^Token\s+/i, '').trim() : v.trim();
+      return provider === 'nimbus'
+        ? v.replace(/^Token\s+/i, '').trim()
+        : v.trim();
     };
 
     const userSnap = await this.db.collection('users').doc(uid).get();

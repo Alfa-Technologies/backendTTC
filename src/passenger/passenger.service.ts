@@ -1,4 +1,9 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  BadRequestException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { FirebaseService } from '../firebase/firebase.service';
 import { DriverService } from '../driver/driver.service';
 import { NimbusService } from '../nimbus/nimbus.service';
@@ -29,6 +34,11 @@ export class PassengerService {
     routeId: string,
     query: { targetStopId?: string; depotId?: number },
   ) {
+    if (!process.env.NIMBUS_API_URL) {
+      throw new InternalServerErrorException('NIMBUS_API_URL no configurada');
+    }
+    const nimbusApiUrl = process.env.NIMBUS_API_URL;
+
     const { targetStopId, depotId } = query;
 
     try {
@@ -59,10 +69,10 @@ export class PassengerService {
         depots = [{ id: depotId }];
       } else {
         const depotsResponse = await firstValueFrom(
-          this.httpService.get(
-            `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depots`,
-            { headers, timeout: 30000 },
-          ),
+          this.httpService.get(`${nimbusApiUrl}/depots`, {
+            headers,
+            timeout: 30000,
+          }),
         );
         depots = depotsResponse.data.depots || [];
       }
@@ -76,10 +86,10 @@ export class PassengerService {
 
         try {
           const routesResponse = await firstValueFrom(
-            this.httpService.get(
-              `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/routes`,
-              { headers, timeout: 30000 },
-            ),
+            this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/routes`, {
+              headers,
+              timeout: 30000,
+            }),
           );
           const routes = routesResponse.data.routes || [];
           depotToRoutesMap.set(depot.id, routes);
@@ -112,10 +122,10 @@ export class PassengerService {
 
         try {
           const ridesResponse = await firstValueFrom(
-            this.httpService.get(
-              `${process.env.NIMBUS_API_URL || 'https://nimbus.wialon.com/api'}/depot/${depot.id}/rides`,
-              { headers, timeout: 30000 },
-            ),
+            this.httpService.get(`${nimbusApiUrl}/depot/${depot.id}/rides`, {
+              headers,
+              timeout: 30000,
+            }),
           );
           const rides = ridesResponse.data.rides || [];
 
@@ -141,9 +151,6 @@ export class PassengerService {
               selectedRide = ride;
               foundDepotId = depot.id;
               isActiveNow = true;
-              this.logger.log(
-                `✅ Viaje ACTIVO encontrado: ${ride.id} (${dayjs.unix(startUnix).tz(MX_TIMEZONE).format('HH:mm')} - ${dayjs.unix(endUnix).tz(MX_TIMEZONE).format('HH:mm')})`,
-              );
               break;
             }
           }
@@ -172,9 +179,6 @@ export class PassengerService {
               selectedRide = closestFutureRide;
               foundDepotId = depot.id;
               isActiveNow = false;
-              this.logger.log(
-                `📅 Viaje PRÓXIMO encontrado: ${closestFutureRide.id} (inicia a las ${dayjs.unix(closestStartUnix).tz(MX_TIMEZONE).format('HH:mm')})`,
-              );
             }
           }
         } catch (error) {
@@ -186,9 +190,6 @@ export class PassengerService {
 
       // 5. Si no hay viaje activo ni próximo, retornar currentStatus con valores nulos
       if (!selectedRide) {
-        this.logger.log(
-          `No se encontró viaje activo ni próximo para routeId ${routeId}`,
-        );
         return {
           isActive: false,
           currentStatus: {
